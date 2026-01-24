@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install Sprite CLI
-        run: curl -fsSL https://sprites.dev/install.sh | sh
+        run: curl -fsSL https://sprites.dev/install.sh | bash
 
       - name: Check and restart gateway if needed
         env:
