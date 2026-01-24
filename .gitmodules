@@ -1,0 +1,3 @@
+[submodule "solana-swaps"]
+	path = solana-swaps
+	url = git@github.com:imthatcarlos/solana-swaps-skill.git

@@ -1,0 +1,38 @@
+name: Keep Sprite Alive
+
+on:
+  schedule:
+    # Every 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Sprite CLI
+        run: curl -fsSL https://sprites.dev/install.sh | sh
+
+      - name: Check and restart gateway if needed
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Check if gateway is running
+          GATEWAY_RUNNING=$(sprite exec -s clawd -- pgrep -f clawdbot-gateway || echo "")
+
+          if [ -z "$GATEWAY_RUNNING" ]; then
+            echo "Gateway not running, starting it..."
+            # Clean up any stale lock files
+            sprite exec -s clawd -- rm -f ~/.clawdbot/gateway.*.lock 2>/dev/null || true
+            # Start gateway in background TTY session
+            sprite exec -s clawd -tty -- npx clawdbot gateway --port 18789 &
+            sleep 5
+            echo "Gateway started"
+          else
+            echo "Gateway already running (PID: $GATEWAY_RUNNING)"
+          fi
+
+          # Log keepalive
+          sprite exec -s clawd -- echo "keepalive $(date)"
