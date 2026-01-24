@@ -13,9 +13,14 @@ jobs:
       - name: Install Sprite CLI
         run: curl -fsSL https://sprites.dev/install.sh | bash
 
-      - name: Check and restart gateway if needed
+      - name: Authenticate Sprite CLI
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          SPRITE_AUTH_TOKEN: ${{ secrets.SPRITE_AUTH_TOKEN }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          sprite auth setup --token "$SPRITE_AUTH_TOKEN"
+
+      - name: Check and restart gateway if needed
         run: |
           export PATH="$HOME/.local/bin:$PATH"
 
