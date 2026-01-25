@@ -17,8 +17,8 @@ ENV PATH="/root/.local/share/solana/install/active_release/bin:$PATH"
 
 WORKDIR /app
 
-# Install clawdbot globally (pin to working version)
-RUN npm install -g clawdbot@2026.1.23-1
+# Install clawdbot globally (latest version, rebuilt on each deploy)
+RUN npm install -g clawdbot@latest
 
 # Copy clawdbot config to init location (volume mounted at runtime to /root/.clawdbot)
 COPY .clawdbot/ /app/clawdbot-init/
