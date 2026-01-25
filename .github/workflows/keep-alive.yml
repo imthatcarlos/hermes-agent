@@ -2,8 +2,8 @@ name: Keep Sprite Alive
 
 on:
   schedule:
-    # Every minute
-    - cron: '* * * * *'
+    # Every 5 minutes (GitHub Actions minimum interval)
+    - cron: '*/5 * * * *'
   workflow_dispatch: # Allow manual trigger
 
 jobs:
@@ -20,30 +20,19 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           sprite auth setup --token "$SPRITE_AUTH_TOKEN"
 
-      - name: Keep alive loop (ping every 25s for ~1 minute)
+      - name: Check and restart gateway if needed
         run: |
           export PATH="$HOME/.local/bin:$PATH"
 
-          for i in 1 2 3; do
-            echo "=== Ping $i at $(date) ==="
+          # Check if gateway is running
+          GATEWAY_RUNNING=$(sprite exec -s clawd -- pgrep -f clawdbot-gateway 2>/dev/null || echo "")
 
-            # Check if gateway is running
-            GATEWAY_RUNNING=$(sprite exec -s clawd -- pgrep -f clawdbot-gateway 2>/dev/null || echo "")
-
-            if [ -z "$GATEWAY_RUNNING" ]; then
-              echo "Gateway not running, starting it..."
-              sprite exec -s clawd -- rm -f ~/.clawdbot/gateway.*.lock 2>/dev/null || true
-              sprite exec -s clawd -tty -- npx clawdbot gateway --port 18789 &
-              sleep 5
-              echo "Gateway started"
-            else
-              echo "Gateway running (PID: $GATEWAY_RUNNING)"
-            fi
-
-            # Sleep 25s between pings (except after last one)
-            if [ $i -lt 3 ]; then
-              sleep 25
-            fi
-          done
-
-          echo "=== Keepalive complete ==="
+          if [ -z "$GATEWAY_RUNNING" ]; then
+            echo "Gateway not running, starting it..."
+            sprite exec -s clawd -- rm -f ~/.clawdbot/gateway.*.lock 2>/dev/null || true
+            sprite exec -s clawd -tty -- npx clawdbot gateway --port 18789 &
+            sleep 5
+            echo "Gateway started"
+          else
+            echo "Gateway running (PID: $GATEWAY_RUNNING)"
+          fi
