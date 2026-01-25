@@ -2,8 +2,8 @@ name: Keep Sprite Alive
 
 on:
   schedule:
-    # Every 15 minutes
-    - cron: '*/15 * * * *'
+    # Every minute
+    - cron: '* * * * *'
   workflow_dispatch: # Allow manual trigger
 
 jobs:
@@ -20,24 +20,30 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           sprite auth setup --token "$SPRITE_AUTH_TOKEN"
 
-      - name: Check and restart gateway if needed
+      - name: Keep alive loop (ping every 25s for ~1 minute)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
 
-          # Check if gateway is running
-          GATEWAY_RUNNING=$(sprite exec -s clawd -- pgrep -f clawdbot-gateway || echo "")
+          for i in 1 2 3; do
+            echo "=== Ping $i at $(date) ==="
 
-          if [ -z "$GATEWAY_RUNNING" ]; then
-            echo "Gateway not running, starting it..."
-            # Clean up any stale lock files
-            sprite exec -s clawd -- rm -f ~/.clawdbot/gateway.*.lock 2>/dev/null || true
-            # Start gateway in background TTY session
-            sprite exec -s clawd -tty -- npx clawdbot gateway --port 18789 &
-            sleep 5
-            echo "Gateway started"
-          else
-            echo "Gateway already running (PID: $GATEWAY_RUNNING)"
-          fi
+            # Check if gateway is running
+            GATEWAY_RUNNING=$(sprite exec -s clawd -- pgrep -f clawdbot-gateway 2>/dev/null || echo "")
 
-          # Log keepalive
-          sprite exec -s clawd -- echo "keepalive $(date)"
+            if [ -z "$GATEWAY_RUNNING" ]; then
+              echo "Gateway not running, starting it..."
+              sprite exec -s clawd -- rm -f ~/.clawdbot/gateway.*.lock 2>/dev/null || true
+              sprite exec -s clawd -tty -- npx clawdbot gateway --port 18789 &
+              sleep 5
+              echo "Gateway started"
+            else
+              echo "Gateway running (PID: $GATEWAY_RUNNING)"
+            fi
+
+            # Sleep 25s between pings (except after last one)
+            if [ $i -lt 3 ]; then
+              sleep 25
+            fi
+          done
+
+          echo "=== Keepalive complete ==="
