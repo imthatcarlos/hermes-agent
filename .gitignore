@@ -1,3 +1,10 @@
 .env
 .gitmodules
 .sprite
+
+# Sensitive clawdbot files (secrets managed via Railway env vars)
+.clawdbot/credentials/
+.clawdbot/agents/
+.clawdbot/telegram/
+*.keypair.json
+solana-keypair.json
