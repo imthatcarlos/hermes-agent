@@ -3,8 +3,10 @@
 .sprite
 
 # Sensitive clawdbot files (secrets managed via Railway env vars)
-.clawdbot/credentials/
 .clawdbot/agents/
 .clawdbot/telegram/
 *.keypair.json
 solana-keypair.json
+
+# Note: .clawdbot/credentials/ contains telegram-allowFrom.json (user IDs, not secrets)
+# which is needed for the bot to recognize authorized users
