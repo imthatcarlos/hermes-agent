@@ -1,10 +1,12 @@
 FROM node:24-slim
 
-# Install dependencies for Solana CLI and general utilities
+# Install dependencies for Solana CLI and debugging
 RUN apt-get update && apt-get install -y \
     curl \
     ca-certificates \
     git \
+    bash \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Solana CLI
@@ -18,15 +20,19 @@ WORKDIR /app
 # Install clawdbot globally (pin to working version)
 RUN npm install -g clawdbot@2026.1.23-1
 
-# Copy clawdbot config
-COPY .clawdbot/ /root/.clawdbot/
+# Copy clawdbot config to init location (volume mounted at runtime to /root/.clawdbot)
+COPY .clawdbot/ /app/clawdbot-init/
 
-# Set workspace directory
-RUN mkdir -p /app/workspace
+# Copy and setup entrypoint script
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Create directories
+RUN mkdir -p /root/.clawdbot /app/workspace
 WORKDIR /app/workspace
 
 # Gateway port
 EXPOSE 18789
 
-# Start gateway in foreground
-CMD ["npx", "clawdbot", "gateway", "--port", "18789"]
+# Use entrypoint to handle volume initialization
+ENTRYPOINT ["/app/entrypoint.sh"]
