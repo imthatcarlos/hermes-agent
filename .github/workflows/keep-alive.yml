@@ -20,19 +20,28 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           sprite auth setup --token "$SPRITE_AUTH_TOKEN"
 
-      - name: Check and restart gateway if needed
+      - name: Keep alive loop (ping every 25s for ~5 minutes)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
 
-          # Check if gateway is running
-          GATEWAY_RUNNING=$(sprite exec -s clawd -- pgrep -f clawdbot-gateway 2>/dev/null || echo "")
+          for i in $(seq 1 12); do
+            echo "=== Ping $i/12 at $(date) ==="
 
-          if [ -z "$GATEWAY_RUNNING" ]; then
-            echo "Gateway not running, starting it..."
-            sprite exec -s clawd -- rm -f ~/.clawdbot/gateway.*.lock 2>/dev/null || true
-            sprite exec -s clawd -tty -- npx clawdbot gateway --port 18789 &
-            sleep 5
-            echo "Gateway started"
-          else
-            echo "Gateway running (PID: $GATEWAY_RUNNING)"
-          fi
+            GATEWAY_RUNNING=$(sprite exec -s clawd -- pgrep -f clawdbot-gateway 2>/dev/null || echo "")
+
+            if [ -z "$GATEWAY_RUNNING" ]; then
+              echo "Gateway not running, starting it..."
+              sprite exec -s clawd -- rm -f ~/.clawdbot/gateway.*.lock 2>/dev/null || true
+              sprite exec -s clawd -tty -- npx clawdbot gateway --port 18789 &
+              sleep 5
+              echo "Gateway started"
+            else
+              echo "Gateway running (PID: $GATEWAY_RUNNING)"
+            fi
+
+            if [ $i -lt 12 ]; then
+              sleep 25
+            fi
+          done
+
+          echo "=== Keepalive complete ==="
