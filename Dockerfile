@@ -1,6 +1,6 @@
 FROM node:24-slim
 
-# Install dependencies for Solana CLI, GitHub CLI, and debugging
+# Install dependencies for Solana CLI, GitHub CLI, Python, and debugging
 RUN apt-get update && apt-get install -y \
     curl \
     ca-certificates \
@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y \
     bash \
     jq \
     gpg \
+    python3 \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI
