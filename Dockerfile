@@ -1,6 +1,6 @@
 FROM node:24-slim
 
-# Install dependencies for Solana CLI, GitHub CLI, Python, and debugging
+# Install dependencies for Solana CLI, GitHub CLI, Python, Bun, and debugging
 RUN apt-get update && apt-get install -y \
     curl \
     ca-certificates \
@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     gpg \
     python3 \
     python3-pip \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI
@@ -30,18 +31,18 @@ ENV PATH="/root/.local/share/solana/install/active_release/bin:$PATH"
 
 WORKDIR /app
 
-# Install clawdbot globally (latest version, rebuilt on each deploy)
-RUN npm install -g clawdbot@latest
+# Install openclaw globally (latest version, rebuilt on each deploy)
+RUN npm install -g openclaw@latest
 
-# Copy clawdbot config to init location (volume mounted at runtime to /root/.clawdbot)
-COPY .clawdbot/ /app/clawdbot-init/
+# Copy openclaw config to init location (volume mounted at runtime to /root/.openclaw)
+COPY .clawdbot/ /app/openclaw-init/
 
 # Copy and setup entrypoint script
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 # Create directories
-RUN mkdir -p /root/.clawdbot /app/workspace
+RUN mkdir -p /root/.openclaw /app/workspace
 WORKDIR /app/workspace
 
 # Gateway port
