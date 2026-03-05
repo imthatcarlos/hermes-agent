@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 
 echo "=== OpenClaw Entrypoint ==="
 echo "Date: $(date)"
@@ -62,6 +61,22 @@ echo "Mission Control started (PID: $MC_PID)"
 
 cd /app/workspace
 
-# === Start OpenClaw Gateway (PID 1) ===
-echo "=== Starting Gateway ==="
-exec npx openclaw gateway --port 18789
+# === Start OpenClaw Gateway with crash recovery ===
+FAILURES=0
+MAX_FAILURES=3
+
+while true; do
+    FAILURES=$((FAILURES+1))
+    echo "=== Starting Gateway (attempt $FAILURES) ==="
+    npx openclaw gateway --port 18789
+    EXIT_CODE=$?
+    echo "Gateway exited with code $EXIT_CODE at $(date)"
+
+    if [ $FAILURES -ge $MAX_FAILURES ]; then
+        echo "Gateway failed $FAILURES times. Staying alive for SSH debugging..."
+        sleep infinity
+    fi
+
+    echo "Restarting in 5s..."
+    sleep 5
+done
