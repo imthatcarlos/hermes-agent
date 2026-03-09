@@ -8,17 +8,13 @@ OPENCLAW_INIT="/app/openclaw-init"
 
 mkdir -p "$OPENCLAW_DIR"
 
-# If no config, copy from build artifacts
-if [ ! -f "$OPENCLAW_DIR/openclaw.json" ]; then
-    echo "No config found, initializing from build artifacts..."
-    if [ -d "$OPENCLAW_INIT" ] && [ -f "$OPENCLAW_INIT/openclaw.json" ]; then
-        cp -rv "$OPENCLAW_INIT/"* "$OPENCLAW_DIR/"
-    else
-        echo "ERROR: Init directory or config not found!"
-        exit 1
-    fi
+# Always overwrite config from build artifacts (source of truth is the repo)
+if [ -d "$OPENCLAW_INIT" ] && [ -f "$OPENCLAW_INIT/openclaw.json" ]; then
+    echo "Syncing config from build artifacts..."
+    cp -rv "$OPENCLAW_INIT/"* "$OPENCLAW_DIR/"
 else
-    echo "Existing openclaw config found."
+    echo "ERROR: Init directory or config not found!"
+    exit 1
 fi
 
 if [ ! -f "$OPENCLAW_DIR/openclaw.json" ]; then
@@ -44,7 +40,7 @@ export AUTH_SECRET="${MC_AUTH_SECRET:-6561c6a51a6029851bf9b48a9178cebe}"
 export MC_COOKIE_SECURE=true
 export MC_COOKIE_SAMESITE=strict
 export MC_ALLOWED_HOSTS="${MC_ALLOWED_HOSTS:-localhost,127.0.0.1}"
-export OPENCLAW_HOME="$OPENCLAW_DIR"
+export OPENCLAW_HOME="/root"
 export OPENCLAW_GATEWAY_HOST=127.0.0.1
 export OPENCLAW_GATEWAY_PORT=18789
 export OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-}"
@@ -61,14 +57,38 @@ echo "Mission Control started (PID: $MC_PID)"
 
 cd /app/workspace
 
+# === Clear stale Telegram polling before starting gateway ===
+# Railway rolling deploys can leave the old container polling, causing 409 conflicts.
+if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+    echo "Clearing stale Telegram polling state..."
+    curl -sf "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=false" || true
+    echo "Waiting 10s for old polling connections to expire..."
+    sleep 10
+fi
+
 # === Start OpenClaw Gateway with crash recovery ===
 FAILURES=0
 MAX_FAILURES=3
 
 while true; do
     FAILURES=$((FAILURES+1))
+
+    # Re-initialize config if it was wiped (openclaw doctor bug #40410/#10688)
+    if [ ! -s "$OPENCLAW_DIR/openclaw.json" ]; then
+        echo "WARNING: openclaw.json missing or empty, restoring from init..."
+        cp -v "$OPENCLAW_INIT/openclaw.json" "$OPENCLAW_DIR/openclaw.json"
+    fi
+
+    # Kill any orphaned gateway processes from previous attempts
+    if [ $FAILURES -gt 1 ]; then
+        echo "Cleaning up orphaned processes..."
+        pkill -f "openclaw-gateway" 2>/dev/null || true
+        pkill -f "openclaw" 2>/dev/null || true
+        sleep 5
+    fi
+
     echo "=== Starting Gateway (attempt $FAILURES) ==="
-    npx openclaw gateway --port 18789
+    npx openclaw gateway --port 18789 --allow-unconfigured
     EXIT_CODE=$?
     echo "Gateway exited with code $EXIT_CODE at $(date)"
 

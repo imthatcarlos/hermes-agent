@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     gpg \
     python3 \
     python3-pip \
+    procps \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 

@@ -51,7 +51,7 @@
       "enabled": true,
       "dmPolicy": "pairing",
       "groupPolicy": "allowlist",
-      "streamMode": "partial"
+      "streaming": "partial"
     }
   },
   "gateway": {
