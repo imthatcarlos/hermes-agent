@@ -44,8 +44,10 @@ export OPENCLAW_HOME="/root"
 export OPENCLAW_GATEWAY_HOST=127.0.0.1
 export OPENCLAW_GATEWAY_PORT=18789
 export OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-}"
-export NEXT_PUBLIC_GATEWAY_HOST=127.0.0.1
-export NEXT_PUBLIC_GATEWAY_PORT=18789
+# Frontend WS connects via server-side proxy, not directly to gateway
+export NEXT_PUBLIC_GATEWAY_HOST=""
+export NEXT_PUBLIC_GATEWAY_PORT=""
+export NEXT_PUBLIC_GATEWAY_URL=""
 export MISSION_CONTROL_DATA_DIR="$MC_DATA_DIR"
 export MISSION_CONTROL_DB_PATH="$MC_DATA_DIR/mission-control.db"
 export MISSION_CONTROL_TOKENS_PATH="$MC_DATA_DIR/mission-control-tokens.json"
