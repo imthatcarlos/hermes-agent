@@ -35,15 +35,6 @@ WORKDIR /app
 # Install openclaw globally (latest version, rebuilt on each deploy)
 RUN npm install -g openclaw@latest
 
-# Install pnpm for Mission Control
-RUN npm install -g pnpm
-
-# Clone and build Mission Control dashboard
-RUN git clone --depth 1 https://github.com/builderz-labs/mission-control.git /app/mission-control
-WORKDIR /app/mission-control
-RUN pnpm install --frozen-lockfile 2>/dev/null || pnpm install
-RUN pnpm build
-
 WORKDIR /app
 
 # Copy openclaw config to init location (volume mounted at runtime to /root/.openclaw)
@@ -57,8 +48,8 @@ RUN chmod +x /app/entrypoint.sh
 RUN mkdir -p /root/.openclaw /app/workspace
 WORKDIR /app/workspace
 
-# Gateway port + Mission Control port
-EXPOSE 18789 3001
+# Gateway port
+EXPOSE 18789
 
 # Use entrypoint to handle volume initialization
 ENTRYPOINT ["/app/entrypoint.sh"]
