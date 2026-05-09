@@ -6,3 +6,14 @@ dockerfilePath = "Dockerfile"
 startCommand = "/app/entrypoint.sh"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
+
+# Hermes gateway (existing public endpoint)
+[[deploy.tcpProxy]]
+applicationPort = 18789
+
+# Sherwood Fund dashboard — Caddy basic-auth proxy in front of Hermes.
+# Hermes itself binds to 127.0.0.1; only Caddy on 9118 is publicly reachable.
+# Set DASHBOARD_PASSWORD (and optionally DASHBOARD_USERNAME) on this Railway
+# service. If DASHBOARD_PASSWORD is unset, the dashboard is skipped at boot.
+[[deploy.tcpProxy]]
+applicationPort = 9118
