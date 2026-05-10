@@ -191,6 +191,105 @@ async function cgTokenPrices(addresses, fetchPaid) {
     return out;
 }
 
+// ---- DexScreener symbol resolution (free), with sanity gates ----
+//
+// Resolves a Checkr token symbol → canonical Base contract address.
+// The point of Checkr is early signal — tokens that have social
+// attention before they show up in DexScreener's top-volume seeds.
+// So we need this resolver, but with strict gates to filter the
+// honeypots / dead-tokens / broken-data we hit on the first attempt
+// (LFI: $153M mcap / $0 vol; TOSHI: $0 mcap / $92M liq; REPPO: $11M
+// mcap / signal_score 2.01).
+//
+// Gates a candidate must pass:
+//   1. Highest-liquidity Base pair has liquidity >= $50k
+//      (filters dead pairs and pure honeypots).
+//   2. 24h volume > $1k (real tradeability — even early tokens trade
+//      a little; $0 means dead or paused).
+//   3. mcap or fdv reported > $250k (real reported value; $0 mcap
+//      with $80M+ liquidity is broken data, drop it).
+//   4. Liquidity-to-mcap ratio < 80% (legitimate tokens have liquidity
+//      that's a fraction of mcap; ratios > 80% mean the "mcap" is
+//      wrong or the pool is wash-traded).
+//
+// Returns the validated candidate object, or null with a `reason`
+// log line. Reasons are shown in the console summary so we can see
+// which Checkr-hyped tokens failed which gate.
+const RESOLVER_MIN_LIQUIDITY = 50_000;
+const RESOLVER_MIN_VOL24 = 1_000;
+const RESOLVER_MIN_MCAP = 250_000;
+const RESOLVER_MAX_LIQ_MCAP_RATIO = 0.80;
+
+async function dexscreenerResolveSymbol(symbol) {
+    if (!symbol) return { ok: false, reason: "empty symbol" };
+    const url = `${DEXSCREENER_BASE}/latest/dex/search?q=${encodeURIComponent(symbol)}`;
+    let data;
+    try {
+        const r = await fetch(url);
+        if (!r.ok) return { ok: false, reason: `DS search HTTP ${r.status}` };
+        data = await r.json();
+    } catch (e) {
+        return { ok: false, reason: `DS search threw: ${e.message}` };
+    }
+    const target = symbol.toUpperCase();
+    const pairs = (data.pairs || []).filter(p => p.chainId === "base");
+    if (pairs.length === 0) return { ok: false, reason: "no Base pairs" };
+
+    // Aggregate by token (a token can have multiple pools — sum their
+    // liquidity + volume, take the best mcap signal). Match by baseToken
+    // symbol case-insensitive.
+    const byAddr = new Map();
+    for (const p of pairs) {
+        const baseSym = (p.baseToken?.symbol || "").toUpperCase();
+        const baseAddr = p.baseToken?.address?.toLowerCase();
+        if (baseSym !== target || !baseAddr) continue;
+        const liq = parseFloat(p.liquidity?.usd || "0");
+        const vol = parseFloat(p.volume?.h24 || "0");
+        const mcap = parseFloat(p.marketCap || "0");
+        const fdv = parseFloat(p.fdv || "0");
+        const existing = byAddr.get(baseAddr) || {
+            address: baseAddr,
+            symbol: p.baseToken.symbol,
+            name: p.baseToken.name || p.baseToken.symbol,
+            decimals: 18,
+            liquidity_usd: 0, volume_usd_h24: 0,
+            mcap_usd: 0, fdv_usd: 0, price_usd: 0,
+        };
+        existing.liquidity_usd += liq;
+        existing.volume_usd_h24 += vol;
+        if (mcap > existing.mcap_usd) existing.mcap_usd = mcap;
+        if (fdv > existing.fdv_usd) existing.fdv_usd = fdv;
+        existing.price_usd = parseFloat(p.priceUsd || "0") || existing.price_usd;
+        byAddr.set(baseAddr, existing);
+    }
+    if (byAddr.size === 0) return { ok: false, reason: "no symbol-matching baseToken pair" };
+
+    // Pick the most-liquid match (deepest pool ≈ most legit token).
+    const sorted = [...byAddr.values()].sort((a, b) => b.liquidity_usd - a.liquidity_usd);
+    const top = sorted[0];
+
+    // Apply gates.
+    const effectiveMcap = Math.max(top.mcap_usd, top.fdv_usd);
+    if (top.liquidity_usd < RESOLVER_MIN_LIQUIDITY) {
+        return { ok: false, reason: `liq $${(top.liquidity_usd/1e3).toFixed(0)}k < $${RESOLVER_MIN_LIQUIDITY/1e3}k floor`, candidate: top };
+    }
+    if (top.volume_usd_h24 < RESOLVER_MIN_VOL24) {
+        return { ok: false, reason: `vol24 $${top.volume_usd_h24.toFixed(0)} < $${RESOLVER_MIN_VOL24} floor (dead/paused)`, candidate: top };
+    }
+    if (effectiveMcap < RESOLVER_MIN_MCAP) {
+        return { ok: false, reason: `mcap+fdv $${(effectiveMcap/1e3).toFixed(0)}k < $${RESOLVER_MIN_MCAP/1e3}k floor (broken data?)`, candidate: top };
+    }
+    if (effectiveMcap > 0) {
+        const ratio = top.liquidity_usd / effectiveMcap;
+        if (ratio > RESOLVER_MAX_LIQ_MCAP_RATIO) {
+            return { ok: false, reason: `liq/mcap ${(ratio*100).toFixed(0)}% > ${RESOLVER_MAX_LIQ_MCAP_RATIO*100}% (anomaly — wash-traded or wrong mcap)`, candidate: top };
+        }
+    }
+    // Adopt fdv as mcap if mcap is missing (so downstream scoring works).
+    if (top.mcap_usd === 0 && top.fdv_usd > 0) top.mcap_usd = top.fdv_usd;
+    return { ok: true, candidate: top };
+}
+
 // ---- Checkr Social: leaderboard + signal radar ----
 //
 // Per the Checkr docs (api.checkr.social/docs):
@@ -304,13 +403,15 @@ async function checkrSignals(fetchPaid) {
 
 // ---- Merge / score ----
 //
-// Checkr data attaches to tokens already discovered by DS or CG via
-// case-insensitive symbol match. Checkr-only tokens (no DS/CG match)
-// are dropped — if DexScreener doesn't surface a token as a top-volume
-// Base pair, it doesn't have meaningful liquidity to trade against
-// regardless of how much social attention it has. This is the right
-// filter: real trade-ability > social hype.
-function mergeAndScore({ trending, leaderboard, signals, dexscreener }) {
+// Checkr data attaches by symbol to existing DS/CG candidates. For
+// Checkr symbols we don't already have, we resolve via DexScreener
+// search (free) — but only ADD them to the candidate pool if they
+// pass the resolver's sanity gates (real liquidity, real volume,
+// real mcap, sane liq/mcap ratio). This is the early-signal path:
+// catch tokens with social attention before they hit the top-volume
+// seeds, but reject the broken-data and honeypot tokens that the
+// first attempt at this approach surfaced.
+async function mergeAndScore({ trending, leaderboard, signals, dexscreener }) {
     const candidates = new Map();   // key: lowercase address
 
     function upsert(key, patch) {
@@ -348,14 +449,59 @@ function mergeAndScore({ trending, leaderboard, signals, dexscreener }) {
         });
     }
     // Checkr returns no contract addresses — match by symbol (case-insensitive)
-    // against existing DS/CG candidates only. We do NOT resolve unmatched
-    // Checkr symbols via DexScreener search — that approach surfaced too
-    // much noise (dead tokens, $0-vol/$153M-mcap traps, microcap signals
-    // without fundamentals). If DS doesn't already have the token in its
-    // top-volume pairs, it's not worth trading regardless of social attention.
-    const symbolIndex = new Map();
-    for (const [addr, c] of candidates.entries()) {
-        if (c.symbol) symbolIndex.set(c.symbol.toUpperCase(), addr);
+    // against existing DS/CG candidates first. For unmatched symbols,
+    // resolve via DexScreener search (free) so high-attention Checkr
+    // tokens get a fair shot at the basket — but only add them to the
+    // candidate pool if they pass the resolver's sanity gates
+    // (RESOLVER_MIN_LIQUIDITY / VOL24 / MCAP and the liq/mcap ratio).
+    // Resolved candidates that fail get dropped with a per-token reason.
+    const buildSymbolIndex = () => {
+        const idx = new Map();
+        for (const [addr, c] of candidates.entries()) {
+            if (c.symbol) idx.set(c.symbol.toUpperCase(), addr);
+        }
+        return idx;
+    };
+    let symbolIndex = buildSymbolIndex();
+
+    // Collect distinct unmatched Checkr symbols so we resolve each once.
+    const unmatched = new Set();
+    for (const t of [...leaderboard, ...signals]) {
+        if (!t.symbol) continue;
+        if (!symbolIndex.has(t.symbol.toUpperCase())) unmatched.add(t.symbol);
+    }
+    if (unmatched.size > 0) {
+        console.log(`  resolving ${unmatched.size} unmatched Checkr symbol(s) via DexScreener (free + gated)…`);
+        const resolves = await Promise.allSettled(
+            [...unmatched].map(s => dexscreenerResolveSymbol(s).then(r => [s, r]))
+        );
+        let added = 0;
+        const drops = [];
+        for (const r of resolves) {
+            if (r.status !== "fulfilled") continue;
+            const [sym, result] = r.value;
+            if (result.ok) {
+                upsert(result.candidate.address, {
+                    symbol: result.candidate.symbol,
+                    name: result.candidate.name,
+                    decimals: result.candidate.decimals,
+                    ds_volume_usd_h24: result.candidate.volume_usd_h24,
+                    ds_liquidity_usd: result.candidate.liquidity_usd,
+                    ds_mcap_usd: result.candidate.mcap_usd,
+                    sources: ["dexscreener-resolved"],
+                });
+                added++;
+            } else {
+                drops.push(`${sym} (${result.reason})`);
+            }
+        }
+        console.log(`  dexscreener-resolved: ${added}/${unmatched.size} passed gates`);
+        if (drops.length > 0) {
+            console.log(`  resolver drops:`);
+            for (const d of drops.slice(0, 10)) console.log(`    - ${d}`);
+            if (drops.length > 10) console.log(`    ... and ${drops.length - 10} more`);
+        }
+        symbolIndex = buildSymbolIndex();
     }
 
     let checkrLbMatched = 0, checkrLbDropped = 0;
@@ -538,7 +684,7 @@ async function main() {
     }
 
     // Merge + score.
-    const ranked = mergeAndScore({ trending, leaderboard, signals, dexscreener });
+    const ranked = await mergeAndScore({ trending, leaderboard, signals, dexscreener });
 
     // Drop L1-impersonators (e.g. a $6M-mcap "SOL" on Base pretending to be
     // Solana). Done AFTER scoring so we know which would-have-been-top
