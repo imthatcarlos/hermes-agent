@@ -14,3 +14,4 @@ COPY entrypoint.sh /usr/local/bin/zhf-entrypoint.sh
 RUN chmod +x /usr/local/bin/zhf-entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/zhf-entrypoint.sh"]
+CMD ["gateway", "run"]
