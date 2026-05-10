@@ -84,18 +84,21 @@ function readText(p) { return readFileSync(p, "utf8"); }
 // can cite concrete numbers (mcap, vol, attention) per Burry's lens etc.
 function buildPersonaPrompt(personaName, lensText, basket) {
     const tokens = basket.tokens ?? basket;
+    // The "tail" flag goes in its own column — putting "[tail]" next to the
+    // symbol caused LLMs to copy the suffix into the output JSON's `token`
+    // field, failing schema validation. Keep `symbol` clean.
     const nameRow = (t) => {
-        const tail = t.tail ? " [tail]" : "";
+        const tail = t.tail ? "yes" : "no";
         const mcap = t.mcap_usd ? `$${(t.mcap_usd / 1e6).toFixed(1)}M` : "?";
         const vol = t.vol24_usd ? `$${(t.vol24_usd / 1e6).toFixed(1)}M` : "?";
         const att = t.attention_pct != null ? `${t.attention_pct.toFixed(2)}%` : "?";
         const sig = t.signal_score != null ? t.signal_score.toFixed(2) : "?";
         const sources = (t.sources || []).join(",") || "?";
-        return `| ${t.symbol}${tail} | \`${t.address}\` | ${mcap} | ${vol} | ${att} | ${sig} | ${sources} |`;
+        return `| ${t.symbol} | ${tail} | \`${t.address}\` | ${mcap} | ${vol} | ${att} | ${sig} | ${sources} |`;
     };
     const tokenTable = [
-        "| symbol | address | mcap | 24h vol | attention | signal score | sources |",
-        "|---|---|---|---|---|---|---|",
+        "| symbol | tail | address | mcap | 24h vol | attention | signal score | sources |",
+        "|---|---|---|---|---|---|---|---|",
         ...tokens.map(nameRow),
     ].join("\n");
 
@@ -109,7 +112,9 @@ function buildPersonaPrompt(personaName, lensText, basket) {
         ``,
         `Cite concrete numbers from the table when reasoning. Do not invent data.`,
         ``,
-        `**CRITICAL: the "persona" field MUST be the literal string \`${personaName}\` — no variations, no full names, no alternate spellings.** Even if the lens template above shows a different example (e.g. "warren-buffett"), you MUST emit \`"persona": "${personaName}"\` exactly.`,
+        `**CRITICAL output rules:**`,
+        `- The "persona" field MUST be the literal string \`${personaName}\` — no variations, full names, or alternate spellings. Even if the lens template above shows a different example (e.g. "warren-buffett"), emit \`"persona": "${personaName}"\` exactly.`,
+        `- The "token" field MUST be the bare symbol from the symbol column (e.g. \`"SOL"\`, \`"WETH"\`) — never include the tail flag, the address, or any other annotation. The tail column is informational only.`,
         ``,
         `Emit ONE JSON object — no prose, no markdown fences, no surrounding text:`,
         ``,

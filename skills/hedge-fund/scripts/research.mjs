@@ -91,9 +91,26 @@ async function fetchJson(label, url, fetchPaid) {
         if (/exceeds maximum allowed/i.test(msg)) hints.push("the endpoint demanded more USDC than --max-spend-usdc allows; raise the cap if you trust it");
         if (/insufficient/i.test(msg)) hints.push("agent wallet may be out of USDC on Base — fund it");
         if (/PAYMENT-SIGNATURE|X-PAYMENT/i.test(msg)) hints.push("possible v1↔v2 x402 header mismatch — try downgrading to x402-fetch@^1.x if the upstream API expects PAYMENT-SIGNATURE");
+        if (/Failed to parse payment requirements/i.test(msg)) hints.push("server's 402 schema doesn't match x402 v2 — check the `payment-required` header is base64-encoded JSON with x402Version=2 and accepts[]");
         throw new Error(`${label} → ${msg}${hints.length ? `\n  hint: ${hints.join("; ")}` : ""}`);
     }
-    if (!r.ok) throw new Error(`${label} → HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+    if (!r.ok) {
+        // Capture body + select diagnostic headers so we can reverse-engineer
+        // which scheme the server expected when payment was rejected.
+        const body = (await r.text()).slice(0, 800);
+        const diagHeaders = [
+            "payment-required", "x-payment-response", "content-type",
+            "www-authenticate", "x-error", "x-debug-info",
+        ];
+        const headerDump = diagHeaders
+            .map(h => [h, r.headers.get(h)])
+            .filter(([, v]) => v != null)
+            .map(([h, v]) => `    ${h}: ${String(v).slice(0, 200)}`)
+            .join("\n");
+        throw new Error(
+            `${label} → HTTP ${r.status}\n  body (first 800): ${body}\n  diagnostic headers:\n${headerDump || "    (none)"}`
+        );
+    }
     return r.json();
 }
 
