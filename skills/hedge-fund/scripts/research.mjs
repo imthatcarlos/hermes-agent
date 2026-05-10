@@ -192,17 +192,31 @@ async function cgTokenPrices(addresses, fetchPaid) {
 }
 
 // ---- Checkr Social: leaderboard + signal radar ----
+//
+// Per the Checkr docs (api.checkr.social/docs):
+//   - /v1/leaderboard?limit=50&hours=24  → $0.02, response { data: [...], meta: {...} }
+//   - /v1/leaderboard/all                → $0.05, all 86 tracked tokens
+//   - /v1/signal?limit=20&spiking_only=false → $0.15, response { data: [...], meta: {...} }
+//
+// IMPORTANT: Checkr does NOT return contract addresses — only token
+// symbols. The merge step matches Checkr entries to existing
+// DS/CG candidates by symbol (case-insensitive). Checkr-only
+// candidates (no DS/CG match) are dropped because we need an address
+// to do anything onchain with them.
 async function checkrLeaderboard(fetchPaid) {
-    const url = `${CHECKR_BASE}/leaderboard?limit=20&hours=24`;
+    const url = `${CHECKR_BASE}/leaderboard?limit=50&hours=24&sort_by=ATT_pct`;
     const data = await fetchJson("checkr.leaderboard", url, fetchPaid);
-    // Expected shape: { tokens: [{ symbol, address?, ATT_pct, MS_pct, INF_pct, velocity, ... }] }
-    return (data.tokens || data || []).map((t, idx) => ({
+    const arr = data.data || data.tokens || data || [];
+    return arr.map((t, idx) => ({
         rank: idx + 1,
         symbol: t.symbol,
-        address: (t.address || t.contract || t.ca || "").toLowerCase() || null,
-        attention_pct: parseFloat(t.ATT_pct ?? t.attention_pct ?? "0"),
+        attention_pct: parseFloat(t.ATT_pct ?? "0"),
+        attention_delta: parseFloat(t.ATT_delta ?? t.ATT_delta_pp ?? "0"),
+        mindshare_pct: parseFloat(t.MS_pct ?? "0"),
+        influence_pct: parseFloat(t.INF_pct ?? "0"),
         velocity: parseFloat(t.velocity ?? "0"),
         unique_authors: parseInt(t.unique_authors ?? "0", 10),
+        mentions_24h: parseInt(t.mentions_24h ?? "0", 10),
     }));
 }
 
@@ -271,13 +285,18 @@ async function dexscreenerBaseLiquid(seedAddresses = DEXSCREENER_SEEDS) {
 }
 
 async function checkrSignals(fetchPaid) {
-    const url = `${CHECKR_BASE}/signal?limit=10&spiking_only=false`;
+    // /v1/signal returns { data: [{symbol, score, signal_type, ais, velocity, cascade_multiplier, timing: {entry_quality, urgency}, ...}], meta: {...} }
+    // Limit 20 = max allowed. spiking_only=false to get the full radar.
+    const url = `${CHECKR_BASE}/signal?limit=20&spiking_only=false`;
     const data = await fetchJson("checkr.signal", url, fetchPaid);
-    return (data.signals || data || []).map(s => ({
+    const arr = data.data || data.signals || data || [];
+    return arr.map(s => ({
         symbol: s.symbol,
-        address: (s.address || s.contract || s.ca || "").toLowerCase() || null,
         score: parseFloat(s.score ?? "0"),
         signal_type: s.signal_type,
+        ais: parseFloat(s.ais ?? "0"),
+        velocity: parseFloat(s.velocity ?? "0"),
+        cascade_multiplier: parseFloat(s.cascade_multiplier ?? "0"),
         entry_quality: s.timing?.entry_quality,
         urgency: s.timing?.urgency,
     }));
@@ -321,26 +340,51 @@ function mergeAndScore({ trending, leaderboard, signals, dexscreener }) {
             sources: ["dexscreener"],
         });
     }
+    // Checkr returns no contract addresses — match by symbol against existing
+    // DS/CG candidates. Build a symbol→address index from the candidates we
+    // already have. Case-insensitive (Checkr "AERO" should match DS "Aero"
+    // and CG "AERO"). Tokens Checkr knows about that don't appear in our
+    // DS/CG candidates are dropped — we have nowhere to send funds without
+    // an address.
+    const symbolIndex = new Map();
+    for (const [addr, c] of candidates.entries()) {
+        if (c.symbol) symbolIndex.set(c.symbol.toUpperCase(), addr);
+    }
+    let checkrLbMatched = 0, checkrLbDropped = 0;
     for (const t of leaderboard) {
-        if (!t.address) continue;
-        upsert(t.address, {
-            symbol: t.symbol || candidates.get(t.address)?.symbol,
+        if (!t.symbol) { checkrLbDropped++; continue; }
+        const addr = symbolIndex.get(t.symbol.toUpperCase());
+        if (!addr) { checkrLbDropped++; continue; }
+        upsert(addr, {
             checkr_attention_pct: t.attention_pct,
+            checkr_attention_delta: t.attention_delta,
+            checkr_mindshare_pct: t.mindshare_pct,
+            checkr_influence_pct: t.influence_pct,
             checkr_velocity: t.velocity,
+            checkr_unique_authors: t.unique_authors,
+            checkr_mentions_24h: t.mentions_24h,
             sources: ["checkr-leaderboard"],
         });
+        checkrLbMatched++;
     }
+    let checkrSigMatched = 0, checkrSigDropped = 0;
     for (const s of signals) {
-        if (!s.address) continue;
-        upsert(s.address, {
-            symbol: s.symbol || candidates.get(s.address)?.symbol,
+        if (!s.symbol) { checkrSigDropped++; continue; }
+        const addr = symbolIndex.get(s.symbol.toUpperCase());
+        if (!addr) { checkrSigDropped++; continue; }
+        upsert(addr, {
             checkr_signal_score: s.score,
             checkr_signal_type: s.signal_type,
+            checkr_ais: s.ais,
+            checkr_cascade_multiplier: s.cascade_multiplier,
             checkr_entry_quality: s.entry_quality,
             checkr_urgency: s.urgency,
             sources: ["checkr-signal"],
         });
+        checkrSigMatched++;
     }
+    if (leaderboard.length > 0) console.log(`  checkr.leaderboard: ${checkrLbMatched} matched, ${checkrLbDropped} no-address-match`);
+    if (signals.length > 0)     console.log(`  checkr.signal:      ${checkrSigMatched} matched, ${checkrSigDropped} no-address-match`);
 
     // Score each candidate. Scale each axis to 0..1 then weighted sum.
     const arr = [...candidates.values()];
