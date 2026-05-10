@@ -367,6 +367,52 @@ function classifyTail(mcap_usd) {
     return mcap_usd > 0 && mcap_usd < 10_000_000;   // < $10M mcap = long-tail
 }
 
+// Symbols of major L1 native assets that have no business existing as a
+// bare ERC-20 on Base. If we see one, it's almost certainly a scam token
+// using the famous ticker for confusion (e.g. a $6M-mcap "SOL" on Base).
+const L1_NATIVE_TICKERS = new Set([
+    "BTC", "ETH", "SOL", "BNB", "ADA", "DOT", "AVAX", "ATOM", "NEAR",
+    "APT", "SUI", "TON", "TRX", "XRP", "DOGE", "LTC", "XMR", "BCH",
+    "EOS", "ALGO", "ICP", "FIL", "HBAR", "STX", "FTM", "VET", "MATIC",
+]);
+// Legitimate Base wrappers + known native Base tokens that DON'T trip the
+// L1-impersonator filter even though their symbol matches or contains a
+// well-known L1 ticker. Case-sensitive on the canonical brand spelling.
+const KNOWN_BASE_LEGIT = new Set([
+    "WETH", "cbBTC", "WBTC", "tBTC", "cbETH", "wstETH", "weETH", "rETH",
+    "swETH", "ETHx", "ETHFI", "USDC", "USDT", "EURC", "DAI", "USDe",
+    // Native Base / well-known Base ecosystem tokens — added defensively
+    // so they're never accidentally flagged.
+    "AERO", "BRETT", "DEGEN", "VIRTUAL", "TOSHI", "MOG", "KEYCAT",
+]);
+// Common wrapped-token prefixes. A symbol that starts with one of these
+// AND is followed by an L1 ticker is almost always a legit wrapper.
+const WRAPPED_PREFIXES = ["W", "cb", "wst", "we", "st", "r", "sw", "t", "s"];
+
+function isImpersonator(token) {
+    if (!token?.symbol) return false;
+    if (KNOWN_BASE_LEGIT.has(token.symbol)) return false;
+    const upper = token.symbol.toUpperCase();
+    // Direct match against L1 native ticker — the most obvious case
+    // (a bare "SOL" / "BTC" / "ETH" on Base with no wrapping prefix).
+    if (L1_NATIVE_TICKERS.has(upper)) {
+        // Only treat as legit if mcap is large enough that it could plausibly
+        // be a real bridged version (bridges to major L1 assets typically
+        // carry > $500M onchain; small-cap means scam).
+        const mcap = token.mcap_usd ?? token.ds_mcap_usd ?? 0;
+        if (mcap > 500_000_000) return false;
+        return true;
+    }
+    // Symbols like "stSOL", "wAVAX" — a wrapped prefix + L1 ticker is fine.
+    for (const prefix of WRAPPED_PREFIXES) {
+        if (token.symbol.startsWith(prefix)) {
+            const rest = token.symbol.slice(prefix.length);
+            if (rest && L1_NATIVE_TICKERS.has(rest.toUpperCase())) return false;
+        }
+    }
+    return false;
+}
+
 async function main() {
     const args = parseArgs(process.argv.slice(2));
 
@@ -427,10 +473,24 @@ async function main() {
 
     // Merge + score.
     const ranked = mergeAndScore({ trending, leaderboard, signals, dexscreener });
-    if (ranked.length < args.topN) {
-        console.warn(`WARN: only ${ranked.length} candidates after merge, requested ${args.topN}. Will return all available.`);
+
+    // Drop L1-impersonators (e.g. a $6M-mcap "SOL" on Base pretending to be
+    // Solana). Done AFTER scoring so we know which would-have-been-top
+    // tokens were filtered, and report them in the summary so observers
+    // can audit.
+    const impersonators = ranked.filter(c => isImpersonator(c));
+    const safe = ranked.filter(c => !isImpersonator(c));
+    if (impersonators.length > 0) {
+        console.log(`  filtered ${impersonators.length} L1-impersonator(s):`);
+        for (const c of impersonators) {
+            const mcap = c.mcap_usd ?? c.ds_mcap_usd ?? 0;
+            console.log(`    ${c.symbol}  ${c.address}  mcap=$${(mcap / 1e6).toFixed(1)}M  score=${c.score?.toFixed(3) ?? "?"}`);
+        }
     }
-    const top = ranked.slice(0, Math.max(args.topN, Math.min(ranked.length, 12)));
+    if (safe.length < args.topN) {
+        console.warn(`WARN: only ${safe.length} candidates after merge + impersonator filter, requested ${args.topN}. Will return all available.`);
+    }
+    const top = safe.slice(0, Math.max(args.topN, Math.min(safe.length, 12)));
 
     // Bulk-fetch decimals + mcap for top candidates so we can validate addresses + tag tail tokens.
     const addrs = top.map(c => c.address).filter(Boolean);
@@ -471,7 +531,14 @@ async function main() {
             n_trending: trending.length,
             n_leaderboard: leaderboard.length,
             n_signals: signals.length,
-            top_dropped: ranked.slice(args.topN, args.topN + 5).map(c => ({
+            n_impersonators_filtered: impersonators.length,
+            impersonators_filtered: impersonators.map(c => ({
+                symbol: c.symbol,
+                address: c.address,
+                mcap_usd: c.mcap_usd ?? c.ds_mcap_usd ?? 0,
+                score: Number((c.score ?? 0).toFixed(4)),
+            })),
+            top_dropped: safe.slice(args.topN, args.topN + 5).map(c => ({
                 symbol: c.symbol, address: c.address, score: Number(c.score.toFixed(4)),
             })),
         },
