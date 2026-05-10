@@ -44,8 +44,10 @@ syndicate's public XMTP chat — that's the showcase.
 │       │   ├── risk-manager.md      # deterministic concentration caps reference
 │       │   └── pm.md                # confidence-weighted aggregation reference
 │       └── scripts/
+│           ├── research.mjs         # x402 token discovery (CoinGecko + Checkr Social) — produces basket.json
 │           ├── aggregate.mjs        # PM + Risk Manager (deterministic)
-│           └── tokens.json          # USDC, cbBTC, WETH, AERO, DEGEN on Base
+│           ├── package.json         # @x402/fetch + @x402/evm + viem (installed at container build)
+│           └── tokens.json          # legacy static fallback — not loaded in V1
 ├── solana-swaps/                    # legacy git submodule, reference for Hermes SKILL.md format — not loaded into the new container
 ├── .clawdbot/                       # legacy clawdbot config — ignored by the new branch
 └── CLAUDE.md                        # legacy Sprite runbook — superseded by this README
@@ -68,7 +70,7 @@ seed Sherwood config.
 | `API_SERVER_HOST` | yes | `0.0.0.0` |
 | `API_SERVER_KEY` | yes | 32+ random chars — bearer auth on the gateway |
 | `API_SERVER_CORS_ORIGINS` | yes | `*` (or restrict to dashboard URL later) |
-| `AGENT_PRIVATE_KEY` | yes | EVM key for the Sherwood proposer wallet (registered with zerohumanfund). NEVER commit; env var only |
+| `AGENT_PRIVATE_KEY` | yes | EVM key for the Sherwood proposer wallet (registered with zerohumanfund). Same wallet pays x402 micropayments for research (~$0.22 USDC/cycle) — **must hold USDC on Base, fund with at least $5**. NEVER commit; env var only |
 | `BASE_RPC_URL` | yes | e.g. `https://base-rpc.publicnode.com` |
 | `OPENAI_API_KEY` | yes | Venice API key (output of `sherwood venice provision`) |
 | `OPENAI_BASE_URL` | yes | `https://api.venice.ai/api/v1` |
@@ -218,9 +220,13 @@ port instead of 9119.
   orchestration, on-chain integration, and risk math are this repo's
   work.
 - **No backtest.** Don't extrapolate cycle outputs to "performance."
-- **No on-chain context fetch in V1.** Personas reason from training-
-  data priors. A `fetch-context.mjs` adding TVL / volume / sentiment
-  is a worthy V2.
+- **Research basket is dynamic but not curated.** `research.mjs` ranks
+  by 24h volume + social attention + signal radar. Volume can be
+  gamed; attention spikes on hype. Tune the merge/score logic in
+  `research.mjs` if you see junk picks.
+- **x402 payments leak metadata.** Each per-call signature emits an
+  on-chain `transferWithAuthorization` from the agent wallet visible
+  on Basescan. Treat as public.
 
 ## License
 

@@ -7,11 +7,11 @@ metadata:
     category: finance
 required_environment_variables:
   - name: AGENT_PRIVATE_KEY
-    description: EVM private key for the Sherwood proposer wallet (registered with zerohumanfund). Never logged. Never echoed to chat.
+    description: EVM private key for the Sherwood proposer wallet (registered with zerohumanfund). Same wallet pays x402 micropayments for research (~$0.22 USDC/cycle) — must hold USDC on Base. Never logged. Never echoed to chat.
   - name: BASE_RPC_URL
-    description: Base mainnet RPC endpoint (e.g. https://base-rpc.publicnode.com). Used by Sherwood CLI.
+    description: Base mainnet RPC endpoint (e.g. https://base-rpc.publicnode.com). Used by Sherwood CLI and the x402 research script.
   - name: OPENAI_API_KEY
-    description: Venice API key (provisioned via `sherwood venice provision`). Used by Hermes for the persona prompts.
+    description: Venice API key (provisioned via `sherwood venice provision` or set manually). Used by Hermes for the persona prompts.
 ---
 
 # Hedge Fund — multi-persona cycle for zerohumanfund
@@ -51,7 +51,9 @@ is the input to the next.
 ### Step 1 — Preflight
 
 Verify the runtime is healthy. Bail with a clear chat post if anything
-fails.
+fails. Note: **inference is not checked** — the fact that the LLM is
+interpreting this skill is itself proof Hermes inference is working
+(via whatever provider Hermes is configured with).
 
 ```bash
 sherwood --version || echo "FAIL: sherwood CLI missing"
@@ -59,8 +61,6 @@ sherwood identity status || echo "FAIL: no Sherwood identity"
 sherwood syndicate info zerohumanfund | jq -r '.agents[]?' \
     | grep -i "$(sherwood config show | jq -r '.address')" \
     || echo "FAIL: agent wallet not registered with zerohumanfund"
-sherwood venice status | jq -r '.apiKey // empty' \
-    || echo "FAIL: no Venice API key — run sherwood venice provision"
 ```
 
 If any FAIL: post a single concise message to the syndicate chat naming
@@ -78,100 +78,118 @@ CYCLE_ID="$(date -u +%Y-%m-%dT%H%MZ)"
 mkdir -p "/opt/data/skills/finance/hedge-fund/cycles/$CYCLE_ID/signals"
 sherwood chat zerohumanfund send \
     "## Cycle $CYCLE_ID opened
-Personas: Buffett · Wood · Burry. Risk + PM after. Target basket: USDC · cbBTC · WETH · AERO · DEGEN." \
+Personas: Buffett · Wood · Burry. Risk + PM after. Discovering basket via x402 research…" \
     --markdown
 ```
 
-### Step 3 — Load the basket
+### Step 3 — Discover this cycle's basket (x402 research)
 
-Read `scripts/tokens.json` from this skill directory. Five tokens with
-Base addresses + decimals + tail flag.
+Run `scripts/research.mjs` to discover the top-N Base tokens via
+CoinGecko (trending pools) + Checkr Social (attention + signal radar)
+over x402 micropayments. **Costs ~$0.22 USDC per cycle** — the agent
+wallet (`AGENT_PRIVATE_KEY`) must hold USDC on Base.
 
 ```bash
 cd /opt/data/skills/finance/hedge-fund
-cat scripts/tokens.json
+node scripts/research.mjs --execute --top-n 5 \
+    --out "cycles/$CYCLE_ID/basket.json"
 ```
+
+Output (`basket.json`) is consumed by both the persona round (Step 4)
+and the aggregator (Step 5). Shape:
+```json
+{
+  "tokens": [
+    {"symbol":"VIRTUAL","address":"0x0b3e...","decimals":18,"tail":false,"mcap_usd":3e9,"vol24_usd":...,"attention_pct":...,"signal_score":...,"score":0.79,"sources":["coingecko","checkr-leaderboard"]},
+    ...5 tokens total
+  ],
+  "research_summary": {...}
+}
+```
+
+Post a research card to chat naming the picks + why each was chosen
+(cite `sources`, `mcap_usd`, `attention_pct`):
+```bash
+sherwood chat zerohumanfund send "## Cycle $CYCLE_ID — basket
+
+| token | mcap | 24h vol | sources | score |
+|------|------|---------|---------|-------|
+| VIRTUAL | \$3.0B | \$80M | coingecko + checkr | 0.79 |
+| ... |
+" --markdown
+```
+
+If `research.mjs` fails (Coingecko 4xx, Checkr down, USDC balance
+empty), **abort the cycle** and post the failure to chat — do not
+silently fall back to the static `scripts/tokens.json` (which is
+boilerplate and would mislead observers).
 
 ### Step 4 — Persona round
 
 For each of `buffett`, `wood`, `burry` in that order:
 
-1. Read `personas/<name>.md` (the lens prompt for this persona).
-2. Generate the persona's view by reasoning *as that persona* about all
-   five tokens at once. Output exactly the JSON schema the persona file
-   declares — `signal` ∈ `{"bullish","bearish","neutral"}` per token,
-   `confidence` 0–100, `reasoning` ≤ 240 chars per token. No prose
-   outside the JSON object.
+1. Read `personas/<name>.md` (the lens template for this persona).
+2. Read the dynamic basket: `cat cycles/$CYCLE_ID/basket.json`.
+3. Build the persona prompt by combining: the persona's system prompt +
+   crypto-context section, the basket as a JSON list of symbols +
+   addresses, and the per-token research metadata (mcap, 24h vol,
+   attention, signal score, sources).
+4. Generate the persona's view as a JSON object with one entry per
+   token in the basket — `signal` ∈ `{"bullish","bearish","neutral"}`,
+   `confidence` 0–100, `reasoning` ≤ 240 chars. No prose outside JSON.
    ```json
    {
      "persona": "warren-buffett",
      "signals": [
-       {"token":"USDC","signal":"bullish","confidence":90,"reasoning":"..."},
-       {"token":"cbBTC","signal":"neutral","confidence":55,"reasoning":"..."},
-       {"token":"WETH","signal":"neutral","confidence":40,"reasoning":"..."},
-       {"token":"AERO","signal":"bearish","confidence":60,"reasoning":"..."},
-       {"token":"DEGEN","signal":"bearish","confidence":95,"reasoning":"..."}
+       {"token":"<sym1>","signal":"...","confidence":...,"reasoning":"..."},
+       {"token":"<sym2>","signal":"...","confidence":...,"reasoning":"..."},
+       ...
      ]
    }
    ```
-3. Validate: all five tokens present in the order USDC, cbBTC, WETH,
-   AERO, DEGEN; signal in the allowed set; confidence in [0, 100];
-   reasoning ≤ 240 chars. If invalid, retry once with an explicit
-   "emit only the JSON object, no prose" instruction. If invalid twice,
-   skip the persona (note in the next chat post) and continue.
-4. Write the JSON to `cycles/$CYCLE_ID/signals/<name>.json`.
-5. Post a short markdown card to the syndicate chat:
-   ```bash
-   sherwood chat zerohumanfund send "## $PERSONA_DISPLAY_NAME
-
-| token | signal | conf | rationale |
-|------|--------|------|-----------|
-| USDC | bullish | 90 | Cash floor — preserves optionality. |
-| cbBTC | neutral | 55 | ... |
-| ... |
-" --markdown
-   ```
+5. Validate: all basket tokens present in the same order; signals in
+   the allowed set; confidence in [0, 100]; reasoning ≤ 240 chars.
+   If invalid, retry once with an explicit "emit only the JSON object,
+   no prose" instruction. If invalid twice, skip the persona (note in
+   the next chat post) and continue.
+6. Write the JSON to `cycles/$CYCLE_ID/signals/<name>.json`.
+7. Post a short markdown card to the syndicate chat (one row per
+   token in the basket).
 
 ### Step 5 — Risk Manager + PM aggregation
 
-Run the deterministic aggregator. It converts each persona's signals to
-weights, runs confidence-weighted aggregation across personas, then
-applies concentration caps in one shot.
+Run the deterministic aggregator. Pass the dynamic basket from Step 3
+as the `--tokens` source.
 
 ```bash
 cd /opt/data/skills/finance/hedge-fund/cycles/$CYCLE_ID
 node ../../scripts/aggregate.mjs \
     --signals signals/buffett.json signals/wood.json signals/burry.json \
-    --tokens ../../scripts/tokens.json \
+    --tokens basket.json \
     --max-single 0.5 \
     --max-longtail 0.10 \
-    --usdc-floor 0.10 \
     --out target-weights.json
 ```
+
+The default risk caps in V1: `--max-single 0.5` (no single non-stable
+asset > 50%), `--max-longtail 0.10` (sum of `tail:true` tokens ≤ 10%),
+**no stable floor** (the basket may not contain any stable; pass
+`--usdc-floor 0.10` if you've confirmed a stable is present and want
+to enforce a cash sleeve).
 
 Output (`target-weights.json`):
 ```json
 {
-  "weights": {"USDC": 0.18, "cbBTC": 0.42, "WETH": 0.30, "AERO": 0.07, "DEGEN": 0.03},
-  "adjustments": ["AERO clipped 0.12 → 0.07 (long-tail cap)", "..."],
+  "weights": {"<sym1>": 0.32, "<sym2>": 0.31, "<sym3>": 0.26, "<sym4>": 0.06, "<sym5>": 0.05},
+  "adjustments": ["<sym4> clipped 0.19 → 0.06 (long-tail cap)", "..."],
+  "persona_notes": {"warren-buffett": "all-bearish/neutral → no stable in basket, fell back to equal-weight"},
   "by_persona_normalized": { ... }
 }
 ```
 
-Post a markdown table to chat showing the final weights and any
-adjustments the Risk Manager made:
-
-```bash
-sherwood chat zerohumanfund send \
-    "## Risk + PM result
-
-| token | target | adjustment |
-|------|--------|-----------|
-| USDC | 18% | floor enforced |
-| cbBTC | 42% | — |
-| ... |
-" --markdown
-```
+Post a markdown table to chat showing the final weights, the source of
+each token (research provenance from basket.json), and any adjustments
+the Risk Manager made.
 
 ### Step 6 — Vault diff
 
@@ -230,14 +248,20 @@ from this skill.
 1. **NEVER** echo `AGENT_PRIVATE_KEY` to chat or logs.
 2. **NEVER** run `sherwood proposal create` without an explicit
    yes/proceed/confirm from the user in chat.
-3. **NEVER** invent token addresses — only use the addresses in
-   `scripts/tokens.json`. If the basket needs to change, edit
-   `scripts/tokens.json` first.
+3. **NEVER** invent token addresses — only use the addresses returned
+   by `scripts/research.mjs` (or the static fallback in `scripts/tokens.json`
+   if explicitly invoked with `--no-research`, which V1 does not do).
 4. **NEVER** post the same persona's signal twice. If retrying, overwrite
    the JSON file and only post the final card.
 5. If a persona's JSON repeatedly fails validation, abort the cycle —
    submitting a proposal with stale or malformed signals would mislead
    observers.
+6. If `scripts/research.mjs` fails (network, x402 401/402 misalignment,
+   USDC balance empty), **abort the cycle** and post the failure to
+   chat. Do not silently fall back to a stale or hardcoded basket.
+7. The agent wallet must hold USDC on Base for x402 payments
+   (~$0.22/cycle). Monitor balance via the legacy `EVM_PRIVATE_KEY`
+   wallet's USDC balance on Basescan.
 
 ## Files in this skill
 
@@ -246,6 +270,8 @@ from this skill.
 - `personas/burry.md` — contrarian/risk-off prompt template (verbatim from upstream's `michael_burry.py`).
 - `personas/risk-manager.md` — deterministic concentration-cap reference (this skill's adaptation).
 - `personas/pm.md` — confidence-weighted aggregation reference (this skill's adaptation).
+- `scripts/research.mjs` — discovery via x402 (CoinGecko trending pools + Checkr Social leaderboard + signal radar). ~$0.22 USDC/cycle.
 - `scripts/aggregate.mjs` — Risk Manager + PM, deterministic.
-- `scripts/tokens.json` — basket: USDC, cbBTC, WETH, AERO, DEGEN.
-- `README.md` — skill-level overview + provenance.
+- `scripts/package.json` — declares `@x402/fetch` + `@x402/evm` + `viem` for `research.mjs`. Installed at container build via Dockerfile.
+- `scripts/tokens.json` — static fallback basket (legacy boilerplate); **not used in V1** when research.mjs succeeds.
+- `README.md` — skill-level overview + provenance + x402 cost notes.

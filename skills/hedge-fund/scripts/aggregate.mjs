@@ -15,15 +15,35 @@
 // Usage:
 //   node aggregate.mjs \
 //     --signals signals/buffett.json signals/wood.json signals/burry.json \
-//     --tokens ../scripts/tokens.json \
-//     --max-single 0.5 --max-longtail 0.10 --usdc-floor 0.10 \
+//     --tokens basket.json \
+//     --max-single 0.5 --max-longtail 0.10 \
 //     --out target-weights.json
+//
+// `--tokens` accepts either a basket.json from research.mjs (top-level
+// `tokens: [...]`) or a static fallback like the legacy tokens.json.
+//
+// `--usdc-floor` defaults to 0 (no floor). The dynamic basket may not
+// contain USDC at all — pass --usdc-floor 0.10 if you want to re-enable
+// the legacy stable-coin floor (only meaningful when the basket actually
+// contains USDC under that exact symbol).
 
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
 const SIGNAL_VALUES = { bullish: +1, neutral: 0, bearish: -1 };
+
+// Symbol pattern for "stable / cash-equivalent" tokens. We detect from the
+// basket dynamically (instead of hardcoding USDC) so the fully-dynamic
+// research basket can have any stable — or none.
+const STABLE_PATTERN = /^(USDC|USDT|EURC|DAI|FRAX|USDe|PYUSD|GUSD|TUSD|crvUSD|sDAI)$/i;
+function isStable(token) {
+    if (token && typeof token === "object" && token.stable === true) return true;
+    return STABLE_PATTERN.test(token?.symbol || token);
+}
+function findStables(tokens) {
+    return tokens.filter(isStable).map(t => t.symbol);
+}
 
 function parseArgs(argv) {
     const args = {
@@ -32,7 +52,7 @@ function parseArgs(argv) {
         out: "target-weights.json",
         maxSingle: 0.5,
         maxLongtail: 0.10,
-        usdcFloor: 0.10,
+        usdcFloor: 0,
     };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
@@ -67,15 +87,18 @@ function readJson(p) {
 //   bearish  → −confidence/100  (clipped to 0; long-only book)
 //
 // Edge case: a persona that says bearish on every token gets all-zero
-// scores. We default to 100% USDC for that persona (cash is a position).
-function personaToWeights(persona, tokenSymbols) {
+// scores. Default behavior: 100% to the first stable in the basket (cash is
+// a position). If no stable is in the basket, fall back to equal-weight
+// across all tokens (no opinion → don't concentrate).
+function personaToWeights(persona, tokens) {
+    const tokenSymbols = tokens.map(t => t.symbol);
     const scores = {};
     for (const tk of tokenSymbols) scores[tk] = 0;
 
     const sigByToken = Object.fromEntries(persona.signals.map(s => [s.token, s]));
     for (const tk of tokenSymbols) {
         const sig = sigByToken[tk];
-        if (!sig) continue;  // missing token from persona → score 0
+        if (!sig) continue;
         const dir = SIGNAL_VALUES[sig.signal] ?? 0;
         const conf = Math.max(0, Math.min(100, Number(sig.confidence) || 0));
         const raw = dir * (conf / 100);
@@ -84,15 +107,25 @@ function personaToWeights(persona, tokenSymbols) {
 
     const sum = Object.values(scores).reduce((a, b) => a + b, 0);
     if (sum <= 0) {
+        const stables = findStables(tokens);
         const fallback = Object.fromEntries(tokenSymbols.map(t => [t, 0]));
-        fallback.USDC = 1.0;
-        return { rawScores: { ...scores }, normalized: fallback, fallbackToUSDC: true };
+        let note = "all-bearish/neutral";
+        if (stables.length > 0) {
+            fallback[stables[0]] = 1.0;
+            note += ` → fell back to 100% ${stables[0]}`;
+        } else {
+            // No stable in basket — equal-weight across all tokens (no opinion).
+            const w = 1 / tokenSymbols.length;
+            for (const t of tokenSymbols) fallback[t] = w;
+            note += ` → no stable in basket, fell back to equal-weight`;
+        }
+        return { rawScores: { ...scores }, normalized: fallback, fallbackNote: note };
     }
 
     const normalized = Object.fromEntries(
         tokenSymbols.map(t => [t, scores[t] / sum])
     );
-    return { rawScores: scores, normalized, fallbackToUSDC: false };
+    return { rawScores: scores, normalized, fallbackNote: null };
 }
 
 // Equal-weighted average across personas, then renormalize.
@@ -108,19 +141,31 @@ function aggregatePersonas(perPersonaNormalized, tokenSymbols) {
 
 function renormalize(weights, tokenSymbols) {
     const sum = tokenSymbols.reduce((a, t) => a + (weights[t] ?? 0), 0);
-    if (sum <= 0) return Object.fromEntries(tokenSymbols.map(t => [t, t === "USDC" ? 1 : 0]));
+    if (sum <= 0) {
+        // Degenerate input — return equal-weight rather than concentrating
+        // arbitrarily on USDC (which may not be in a dynamic basket).
+        const w = 1 / tokenSymbols.length;
+        return Object.fromEntries(tokenSymbols.map(t => [t, w]));
+    }
     return Object.fromEntries(tokenSymbols.map(t => [t, (weights[t] ?? 0) / sum]));
 }
 
-// Apply caps in order: long-tail, single-asset, USDC floor, then renormalize.
-// Each cap returns adjusted weights + a list of human-readable adjustment notes.
+// Apply caps in order: long-tail, single-asset, optional stable floor, then
+// renormalize. Each cap returns adjusted weights + adjustment notes.
+//
+// "Stable" tokens are detected dynamically from the basket via STABLE_PATTERN
+// (USDC/USDT/EURC/DAI/etc.) — no hardcoded symbols. The single-asset cap
+// excludes stables (they're meant to absorb excess). The stable-floor cap is
+// off by default in V1; pass --usdc-floor to turn it on, and it only fires
+// when at least one stable IS present in the basket.
 function applyCaps(weights, tokens, opts) {
     const tokenSymbols = tokens.map(t => t.symbol);
     const tailSet = new Set(tokens.filter(t => t.tail).map(t => t.symbol));
+    const stableSet = new Set(findStables(tokens));
     const adjustments = [];
     let w = { ...weights };
 
-    // 1) Long-tail cap: sum of tail tokens ≤ maxLongtail.
+    // 1) Long-tail cap.
     const tailSum = [...tailSet].reduce((a, t) => a + (w[t] ?? 0), 0);
     if (tailSum > opts.maxLongtail + 1e-9) {
         const excess = tailSum - opts.maxLongtail;
@@ -132,8 +177,8 @@ function applyCaps(weights, tokens, opts) {
                 `${t} clipped ${(before * 100).toFixed(1)}% → ${(w[t] * 100).toFixed(1)}% (long-tail cap)`
             );
         }
-        // Redistribute excess to non-USDC, non-tail tokens pro-rata.
-        const eligible = tokenSymbols.filter(t => t !== "USDC" && !tailSet.has(t));
+        // Redistribute excess to non-stable, non-tail tokens pro-rata.
+        const eligible = tokenSymbols.filter(t => !stableSet.has(t) && !tailSet.has(t));
         const eligibleSum = eligible.reduce((a, t) => a + (w[t] ?? 0), 0);
         if (eligibleSum > 0) {
             for (const t of eligible) w[t] = (w[t] ?? 0) + excess * ((w[t] ?? 0) / eligibleSum);
@@ -142,9 +187,9 @@ function applyCaps(weights, tokens, opts) {
         }
     }
 
-    // 2) Single-asset cap (excluding USDC): no non-USDC asset > maxSingle.
+    // 2) Single-asset cap (excluding stables — they're the cash sleeve).
     for (const tk of tokenSymbols) {
-        if (tk === "USDC") continue;
+        if (stableSet.has(tk)) continue;
         if ((w[tk] ?? 0) > opts.maxSingle + 1e-9) {
             const before = w[tk];
             const excess = before - opts.maxSingle;
@@ -152,9 +197,10 @@ function applyCaps(weights, tokens, opts) {
             adjustments.push(
                 `${tk} clipped ${(before * 100).toFixed(1)}% → ${(opts.maxSingle * 100).toFixed(1)}% (single-asset cap)`
             );
-            // Excludes tail tokens — pushing single-asset excess into a tail token
-            // would re-inflate above the long-tail cap that just ran.
-            const others = tokenSymbols.filter(t => t !== "USDC" && t !== tk && !tailSet.has(t));
+            // Donors: not the capped token, not stables, not tails.
+            // Tails are excluded so we don't re-inflate above the long-tail cap.
+            // Stables are excluded so their cash-sleeve role isn't loaded up.
+            const others = tokenSymbols.filter(t => t !== tk && !stableSet.has(t) && !tailSet.has(t));
             const othersSum = others.reduce((a, t) => a + (w[t] ?? 0), 0);
             if (othersSum > 0) {
                 for (const t of others) w[t] = (w[t] ?? 0) + excess * ((w[t] ?? 0) / othersSum);
@@ -164,20 +210,31 @@ function applyCaps(weights, tokens, opts) {
         }
     }
 
-    // 3) USDC floor: USDC ≥ usdcFloor. Take from non-USDC, non-tail tokens pro-rata.
-    if ((w.USDC ?? 0) + 1e-9 < opts.usdcFloor) {
-        const before = w.USDC ?? 0;
-        const shortfall = opts.usdcFloor - before;
-        w.USDC = opts.usdcFloor;
-        adjustments.push(
-            `USDC raised ${(before * 100).toFixed(1)}% → ${(opts.usdcFloor * 100).toFixed(1)}% (USDC floor)`
-        );
-        const donors = tokenSymbols.filter(t => t !== "USDC" && !tailSet.has(t));
-        const donorsSum = donors.reduce((a, t) => a + (w[t] ?? 0), 0);
-        if (donorsSum > 0) {
-            for (const t of donors) w[t] = Math.max(0, (w[t] ?? 0) - shortfall * ((w[t] ?? 0) / donorsSum));
-        } else if (donors.length > 0) {
-            for (const t of donors) w[t] = Math.max(0, (w[t] ?? 0) - shortfall / donors.length);
+    // 3) Stable floor (opt-in via --usdc-floor; default 0 = disabled).
+    // Only fires when (a) the floor is > 0 AND (b) at least one stable is in
+    // the basket. We aggregate the floor across ALL stables in the basket and
+    // raise their combined weight to >= floor; donors are non-stable, non-tail.
+    if (opts.usdcFloor > 0 && stableSet.size > 0) {
+        const stables = [...stableSet];
+        const stableSum = stables.reduce((a, t) => a + (w[t] ?? 0), 0);
+        if (stableSum + 1e-9 < opts.usdcFloor) {
+            const shortfall = opts.usdcFloor - stableSum;
+            // Distribute floor pro-rata across stables (or evenly if all are 0).
+            if (stableSum > 0) {
+                for (const t of stables) w[t] = (w[t] ?? 0) + shortfall * ((w[t] ?? 0) / stableSum);
+            } else {
+                for (const t of stables) w[t] = (w[t] ?? 0) + shortfall / stables.length;
+            }
+            adjustments.push(
+                `stables (${stables.join("+")}) raised ${(stableSum * 100).toFixed(1)}% → ${(opts.usdcFloor * 100).toFixed(1)}% (stable floor)`
+            );
+            const donors = tokenSymbols.filter(t => !stableSet.has(t) && !tailSet.has(t));
+            const donorsSum = donors.reduce((a, t) => a + (w[t] ?? 0), 0);
+            if (donorsSum > 0) {
+                for (const t of donors) w[t] = Math.max(0, (w[t] ?? 0) - shortfall * ((w[t] ?? 0) / donorsSum));
+            } else if (donors.length > 0) {
+                for (const t of donors) w[t] = Math.max(0, (w[t] ?? 0) - shortfall / donors.length);
+            }
         }
     }
 
@@ -218,10 +275,10 @@ function main() {
     for (const file of args.signals) {
         const persona = readJson(file);
         validatePersona(persona, tokenSymbols, path.basename(file));
-        const { rawScores, normalized, fallbackToUSDC } = personaToWeights(persona, tokenSymbols);
+        const { rawScores, normalized, fallbackNote } = personaToWeights(persona, tokens);
         perPersonaNormalized[persona.persona] = normalized;
         perPersonaRaw[persona.persona] = rawScores;
-        if (fallbackToUSDC) personaNotes[persona.persona] = "all-bearish/neutral → fell back to 100% USDC";
+        if (fallbackNote) personaNotes[persona.persona] = fallbackNote;
     }
 
     const aggregated = aggregatePersonas(perPersonaNormalized, tokenSymbols);
