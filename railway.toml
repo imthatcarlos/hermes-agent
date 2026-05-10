@@ -6,15 +6,16 @@ dockerfilePath = "Dockerfile"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 
-# Hermes dashboard. Public-but-unguessable URL; auth is via API_SERVER_KEY for
-# the gateway and via Hermes' own session cookie for the dashboard. If the
-# Railway URL leaks, add Caddy basic-auth in front of 127.0.0.1:9119.
-[[deploy.tcpProxy]]
-applicationPort = 9119
-
 # Hermes OpenAI-compatible gateway. Bearer-token auth via API_SERVER_KEY env.
+# Exposed as a TCP proxy because the gateway speaks raw HTTP without HTTPS
+# termination expectations — TCP proxy gives a stable host:port endpoint.
 [[deploy.tcpProxy]]
 applicationPort = 8642
+
+# Hermes dashboard runs on 9119 internally. Generate an HTTP domain in the
+# Railway UI (Settings -> Networking -> Generate Domain), pointing at port
+# 9119, to expose it as https://<service>-production.up.railway.app.
+# (No tcpProxy here — HTTP routing handled by Railway's built-in proxy.)
 
 # Persistent state — Hermes writes config, sessions, skills, memories under here;
 # Sherwood writes ~/.sherwood/config.json under hermes user's HOME (/opt/data).
