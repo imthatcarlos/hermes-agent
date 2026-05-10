@@ -191,56 +191,6 @@ async function cgTokenPrices(addresses, fetchPaid) {
     return out;
 }
 
-// ---- DexScreener symbol resolution (free) ----
-//
-// Resolve a token symbol to its Base contract address by querying
-// DexScreener's free search endpoint. Used to bring Checkr-only tokens
-// (which lack contract addresses in their response) into the candidate
-// pool. We pick the top liquidity-ranked Base pair whose baseToken or
-// quoteToken symbol matches case-insensitive.
-//
-// Returns null if no Base match found above $5k liquidity (filters out
-// scam/abandoned pairs that share the symbol).
-async function dexscreenerResolveSymbol(symbol) {
-    if (!symbol) return null;
-    const url = `${DEXSCREENER_BASE}/latest/dex/search?q=${encodeURIComponent(symbol)}`;
-    let data;
-    try {
-        const r = await fetch(url);
-        if (!r.ok) return null;
-        data = await r.json();
-    } catch {
-        return null;
-    }
-    const target = symbol.toUpperCase();
-    const pairs = (data.pairs || []).filter(p => p.chainId === "base");
-    if (pairs.length === 0) return null;
-
-    // Find pairs where the baseToken's symbol matches our target.
-    const candidates = [];
-    for (const p of pairs) {
-        const baseSym = (p.baseToken?.symbol || "").toUpperCase();
-        const baseAddr = p.baseToken?.address?.toLowerCase();
-        if (baseSym !== target || !baseAddr) continue;
-        const liq = parseFloat(p.liquidity?.usd || "0");
-        if (liq < 5000) continue;
-        candidates.push({
-            address: baseAddr,
-            symbol: p.baseToken.symbol,
-            name: p.baseToken.name || p.baseToken.symbol,
-            decimals: 18,
-            liquidity_usd: liq,
-            volume_usd_h24: parseFloat(p.volume?.h24 || "0"),
-            mcap_usd: parseFloat(p.marketCap || p.fdv || "0"),
-            price_usd: parseFloat(p.priceUsd || "0"),
-        });
-    }
-    if (candidates.length === 0) return null;
-    // Pick the most liquid match — guards against meme-named scams.
-    candidates.sort((a, b) => b.liquidity_usd - a.liquidity_usd);
-    return candidates[0];
-}
-
 // ---- Checkr Social: leaderboard + signal radar ----
 //
 // Per the Checkr docs (api.checkr.social/docs):
@@ -354,9 +304,13 @@ async function checkrSignals(fetchPaid) {
 
 // ---- Merge / score ----
 //
-// async because we resolve unmatched Checkr symbols → addresses via
-// DexScreener search (free) so Checkr-only tokens can join the basket.
-async function mergeAndScore({ trending, leaderboard, signals, dexscreener }) {
+// Checkr data attaches to tokens already discovered by DS or CG via
+// case-insensitive symbol match. Checkr-only tokens (no DS/CG match)
+// are dropped — if DexScreener doesn't surface a token as a top-volume
+// Base pair, it doesn't have meaningful liquidity to trade against
+// regardless of how much social attention it has. This is the right
+// filter: real trade-ability > social hype.
+function mergeAndScore({ trending, leaderboard, signals, dexscreener }) {
     const candidates = new Map();   // key: lowercase address
 
     function upsert(key, patch) {
@@ -393,49 +347,15 @@ async function mergeAndScore({ trending, leaderboard, signals, dexscreener }) {
             sources: ["dexscreener"],
         });
     }
-    // Checkr returns no contract addresses — match by symbol against existing
-    // DS/CG candidates. For unmatched symbols, resolve via DexScreener
-    // search (free) so high-signal Checkr tokens can still enter the basket.
-    const buildSymbolIndex = () => {
-        const idx = new Map();
-        for (const [addr, c] of candidates.entries()) {
-            if (c.symbol) idx.set(c.symbol.toUpperCase(), addr);
-        }
-        return idx;
-    };
-
-    // Collect all distinct unmatched symbols across leaderboard + signal so
-    // we resolve each only once (a symbol may appear in both).
-    let symbolIndex = buildSymbolIndex();
-    const unmatchedSymbols = new Set();
-    for (const t of [...leaderboard, ...signals]) {
-        if (!t.symbol) continue;
-        const upper = t.symbol.toUpperCase();
-        if (!symbolIndex.has(upper)) unmatchedSymbols.add(t.symbol);
-    }
-    if (unmatchedSymbols.size > 0) {
-        console.log(`  resolving ${unmatchedSymbols.size} unmatched Checkr symbol(s) via DexScreener search (free)…`);
-        const resolves = await Promise.allSettled(
-            [...unmatchedSymbols].map(s => dexscreenerResolveSymbol(s).then(r => [s, r]))
-        );
-        let added = 0;
-        for (const r of resolves) {
-            if (r.status !== "fulfilled" || !r.value) continue;
-            const [sym, info] = r.value;
-            if (!info) continue;
-            upsert(info.address, {
-                symbol: info.symbol,
-                name: info.name,
-                decimals: info.decimals,
-                ds_volume_usd_h24: info.volume_usd_h24,
-                ds_liquidity_usd: info.liquidity_usd,
-                ds_mcap_usd: info.mcap_usd,
-                sources: ["dexscreener-resolved"],
-            });
-            added++;
-        }
-        console.log(`  dexscreener-resolved: ${added}/${unmatchedSymbols.size} unmatched symbols added to candidate pool`);
-        symbolIndex = buildSymbolIndex();   // refresh after upserts
+    // Checkr returns no contract addresses — match by symbol (case-insensitive)
+    // against existing DS/CG candidates only. We do NOT resolve unmatched
+    // Checkr symbols via DexScreener search — that approach surfaced too
+    // much noise (dead tokens, $0-vol/$153M-mcap traps, microcap signals
+    // without fundamentals). If DS doesn't already have the token in its
+    // top-volume pairs, it's not worth trading regardless of social attention.
+    const symbolIndex = new Map();
+    for (const [addr, c] of candidates.entries()) {
+        if (c.symbol) symbolIndex.set(c.symbol.toUpperCase(), addr);
     }
 
     let checkrLbMatched = 0, checkrLbDropped = 0;
@@ -618,7 +538,7 @@ async function main() {
     }
 
     // Merge + score.
-    const ranked = await mergeAndScore({ trending, leaderboard, signals, dexscreener });
+    const ranked = mergeAndScore({ trending, leaderboard, signals, dexscreener });
 
     // Drop L1-impersonators (e.g. a $6M-mcap "SOL" on Base pretending to be
     // Solana). Done AFTER scoring so we know which would-have-been-top
