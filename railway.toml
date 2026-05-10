@@ -3,17 +3,21 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "/app/entrypoint.sh"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 
-# Hermes gateway (existing public endpoint)
+# Hermes dashboard. Public-but-unguessable URL; auth is via API_SERVER_KEY for
+# the gateway and via Hermes' own session cookie for the dashboard. If the
+# Railway URL leaks, add Caddy basic-auth in front of 127.0.0.1:9119.
 [[deploy.tcpProxy]]
-applicationPort = 18789
+applicationPort = 9119
 
-# Sherwood Fund dashboard — Caddy basic-auth proxy in front of Hermes.
-# Hermes itself binds to 127.0.0.1; only Caddy on 9118 is publicly reachable.
-# Set DASHBOARD_PASSWORD (and optionally DASHBOARD_USERNAME) on this Railway
-# service. If DASHBOARD_PASSWORD is unset, the dashboard is skipped at boot.
+# Hermes OpenAI-compatible gateway. Bearer-token auth via API_SERVER_KEY env.
 [[deploy.tcpProxy]]
-applicationPort = 9118
+applicationPort = 8642
+
+# Persistent state — Hermes writes config, sessions, skills, memories under here;
+# Sherwood writes ~/.sherwood/config.json under hermes user's HOME (/opt/data).
+[[deploy.volumes]]
+mountPath = "/opt/data"
+name = "hermes-state"
