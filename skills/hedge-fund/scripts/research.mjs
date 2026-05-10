@@ -34,6 +34,20 @@ const DEXSCREENER_BASE = "https://api.dexscreener.com";
 const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const WETH_BASE = "0x4200000000000000000000000000000000000006";
 
+// Broader seed set for DexScreener discovery. Each seed token yields
+// up to 30 pairs from /token-pairs/v1/base/<seed>; combined we cover
+// a much wider slice of liquid Base trading. Used as the primary
+// discovery source when paid x402 endpoints (CoinGecko / Checkr) are
+// unavailable.
+const DEXSCREENER_SEEDS = [
+    USDC_BASE,                                                // USD Coin
+    WETH_BASE,                                                // Wrapped ETH
+    "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2",             // USDT
+    "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42",             // EURC
+    "0x940181a94A35A4569E4529A3CDfB74e38FD98631",             // AERO
+    "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",             // cbBTC
+];
+
 function parseArgs(argv) {
     const args = {
         out: "basket.json",
@@ -196,7 +210,7 @@ async function checkrLeaderboard(fetchPaid) {
 // WETH on Base, sorted by 24h volume. Gives ~30-50 liquid Base tokens with
 // no payment overhead. Used as the primary discovery source when CoinGecko
 // trending is shallow.
-async function dexscreenerBaseLiquid(seedAddresses = [USDC_BASE, WETH_BASE]) {
+async function dexscreenerBaseLiquid(seedAddresses = DEXSCREENER_SEEDS) {
     const out = new Map();
     for (const seed of seedAddresses) {
         const url = `${DEXSCREENER_BASE}/token-pairs/v1/base/${seed}`;
