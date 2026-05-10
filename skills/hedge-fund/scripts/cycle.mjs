@@ -109,6 +109,8 @@ function buildPersonaPrompt(personaName, lensText, basket) {
         ``,
         `Cite concrete numbers from the table when reasoning. Do not invent data.`,
         ``,
+        `**CRITICAL: the "persona" field MUST be the literal string \`${personaName}\` — no variations, no full names, no alternate spellings.** Even if the lens template above shows a different example (e.g. "warren-buffett"), you MUST emit \`"persona": "${personaName}"\` exactly.`,
+        ``,
         `Emit ONE JSON object — no prose, no markdown fences, no surrounding text:`,
         ``,
         `{`,
@@ -120,6 +122,23 @@ function buildPersonaPrompt(personaName, lensText, basket) {
     ].join("\n");
 
     return { systemPrompt, userPrompt };
+}
+
+// Persona-name validation accepts the requested name, optionally with full-
+// name aliases (so "buffett" == "warren-buffett" etc.). LLMs sometimes copy
+// the example string from the lens MD instead of the injected name; we
+// accept both rather than retrying for a one-character mismatch.
+const PERSONA_ALIASES = {
+    buffett: ["buffett", "warren-buffett", "warren_buffett", "warrenbuffett"],
+    wood: ["wood", "cathie-wood", "cathie_wood", "cathiewood"],
+    burry: ["burry", "michael-burry", "michael_burry", "michaelburry"],
+};
+function personaNameMatches(got, want) {
+    const g = String(got || "").toLowerCase();
+    const w = String(want || "").toLowerCase();
+    if (g === w) return true;
+    const aliases = PERSONA_ALIASES[w];
+    return aliases ? aliases.includes(g) : false;
 }
 
 async function callGateway(args, systemPrompt, userPrompt, retryHint = null) {
@@ -163,7 +182,13 @@ function extractJson(raw) {
 
 function validate(parsed, personaName, basketSymbols) {
     if (!parsed || typeof parsed !== "object") return `not an object`;
-    if (parsed.persona !== personaName) return `persona field is "${parsed.persona}", expected "${personaName}"`;
+    if (!personaNameMatches(parsed.persona, personaName)) {
+        return `persona field is "${parsed.persona}", expected "${personaName}" (or a known alias like warren-buffett / cathie-wood / michael-burry)`;
+    }
+    // Normalize the persona field to the requested name so downstream
+    // consumers (aggregate.mjs, the chat card renderer) see consistent
+    // identifiers regardless of which alias the LLM emitted.
+    parsed.persona = personaName;
     if (!Array.isArray(parsed.signals)) return `signals must be an array`;
     if (parsed.signals.length !== basketSymbols.length) return `signals length ${parsed.signals.length} != basket size ${basketSymbols.length}`;
     for (let i = 0; i < basketSymbols.length; i++) {

@@ -90,11 +90,17 @@ Per-cycle artifacts go to
 
 | Call | Provider | Approx cost |
 |---|---|---|
+| `token-pairs/v1/base/USDC` + `/WETH` (broad coverage, ~30-60 candidates) | DexScreener | **free** |
 | `trending_pools?duration=24h` | CoinGecko | $0.01 USDC |
 | `leaderboard?hours=24&limit=20` | Checkr Social | $0.05 USDC |
 | `signal?limit=10` | Checkr Social | $0.15 USDC |
 | `simple/networks/base/token_price/<addrs>` (bulk) | CoinGecko | $0.01 USDC |
 | **Total per research step** | | **~$0.22 USDC** |
+
+DexScreener is the discovery floor — even if all x402 sources are
+down, you still get a basket from Base liquidity. CoinGecko provides
+trending alpha; Checkr provides social momentum. Multi-source
+candidates get a +10% score bonus, triple-source gets +15% total.
 
 Weekly cycle → ~$11/yr in research. Trivial. The `AGENT_PRIVATE_KEY`
 wallet (already on Railway) pays — fund it with **at least $5 USDC on

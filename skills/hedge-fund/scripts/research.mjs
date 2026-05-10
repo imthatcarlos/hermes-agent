@@ -30,7 +30,9 @@ import { privateKeyToAccount } from "viem/accounts";
 
 const COINGECKO_BASE = "https://pro-api.coingecko.com/api/v3/x402";
 const CHECKR_BASE = "https://api.checkr.social/v1";
+const DEXSCREENER_BASE = "https://api.dexscreener.com";
 const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const WETH_BASE = "0x4200000000000000000000000000000000000006";
 
 function parseArgs(argv) {
     const args = {
@@ -40,6 +42,7 @@ function parseArgs(argv) {
         topN: 5,
         maxSpendUsdc: 0.5,           // hard cap on total per call (Coingecko=$0.01, Checkr signal=$0.15)
         skipCheckr: false,           // fall back to Coingecko-only if Checkr is down
+        skipDexscreener: false,      // skip the free Base coverage source
     };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
@@ -50,6 +53,7 @@ function parseArgs(argv) {
             case "--top-n":          args.topN = parseInt(argv[++i], 10); break;
             case "--max-spend-usdc": args.maxSpendUsdc = parseFloat(argv[++i]); break;
             case "--skip-checkr":    args.skipCheckr = true; break;
+            case "--skip-dexscreener": args.skipDexscreener = true; break;
             default:
                 throw new Error(`unknown arg: ${a}`);
         }
@@ -171,6 +175,70 @@ async function checkrLeaderboard(fetchPaid) {
     }));
 }
 
+// ---- DexScreener: free, no x402. Returns all pairs that include USDC or
+// WETH on Base, sorted by 24h volume. Gives ~30-50 liquid Base tokens with
+// no payment overhead. Used as the primary discovery source when CoinGecko
+// trending is shallow.
+async function dexscreenerBaseLiquid(seedAddresses = [USDC_BASE, WETH_BASE]) {
+    const out = new Map();
+    for (const seed of seedAddresses) {
+        const url = `${DEXSCREENER_BASE}/token-pairs/v1/base/${seed}`;
+        let pairs;
+        try {
+            const r = await fetch(url);
+            if (!r.ok) {
+                console.error(`dexscreener seed=${seed} HTTP ${r.status} — skipping`);
+                continue;
+            }
+            pairs = await r.json();
+        } catch (e) {
+            console.error(`dexscreener seed=${seed} threw: ${e.message} — skipping`);
+            continue;
+        }
+        if (!Array.isArray(pairs)) continue;
+        for (const pair of pairs) {
+            if (pair.chainId !== "base") continue;
+            // Pick whichever side ISN'T the seed address — that's the
+            // "discovered" token. Skip pairs where both sides are stables/WETH.
+            const baseAddr = pair.baseToken?.address?.toLowerCase();
+            const quoteAddr = pair.quoteToken?.address?.toLowerCase();
+            const seedLower = seed.toLowerCase();
+            let tok;
+            if (baseAddr && baseAddr !== seedLower) tok = { ...pair.baseToken, address: baseAddr };
+            else if (quoteAddr && quoteAddr !== seedLower) tok = { ...pair.quoteToken, address: quoteAddr };
+            else continue;
+            // Skip if the discovered token is itself a stable.
+            if (STABLE_QUOTE_PATTERN.test(tok.symbol || "")) continue;
+            // Aggregate by token; sum volume and keep the best mcap signal
+            // across pairs (DexScreener may return multiple pools per token).
+            const existing = out.get(tok.address) || {
+                base_address: tok.address,
+                base_symbol: tok.symbol,
+                base_name: tok.name || tok.symbol,
+                base_decimals: 18,
+                volume_usd_h24: 0,
+                liquidity_usd: 0,
+                price_usd: 0,
+                mcap_usd: 0,
+                fdv_usd: 0,
+                source: "dexscreener",
+            };
+            existing.volume_usd_h24 += parseFloat(pair.volume?.h24 || "0");
+            existing.liquidity_usd += parseFloat(pair.liquidity?.usd || "0");
+            existing.price_usd = parseFloat(pair.priceUsd || "0") || existing.price_usd;
+            const pmcap = parseFloat(pair.marketCap || "0");
+            const pfdv = parseFloat(pair.fdv || "0");
+            if (pmcap > existing.mcap_usd) existing.mcap_usd = pmcap;
+            if (pfdv > existing.fdv_usd) existing.fdv_usd = pfdv;
+            out.set(tok.address, existing);
+        }
+    }
+    // Sort by 24h volume descending; trim to 60 to keep merge size manageable.
+    return [...out.values()]
+        .sort((a, b) => b.volume_usd_h24 - a.volume_usd_h24)
+        .slice(0, 60);
+}
+
 async function checkrSignals(fetchPaid) {
     const url = `${CHECKR_BASE}/signal?limit=10&spiking_only=false`;
     const data = await fetchJson("checkr.signal", url, fetchPaid);
@@ -185,13 +253,15 @@ async function checkrSignals(fetchPaid) {
 }
 
 // ---- Merge / score ----
-function mergeAndScore({ trending, leaderboard, signals }) {
+function mergeAndScore({ trending, leaderboard, signals, dexscreener }) {
     const candidates = new Map();   // key: lowercase address
 
     function upsert(key, patch) {
         if (!key) return;
         const existing = candidates.get(key) || {
-            address: key, sources: [], cg_volume_usd_h24: 0, cg_rank: 999,
+            address: key, sources: [],
+            cg_volume_usd_h24: 0, cg_rank: 999,
+            ds_volume_usd_h24: 0, ds_liquidity_usd: 0, ds_mcap_usd: 0,
             checkr_attention_pct: 0, checkr_velocity: 0, checkr_signal_score: 0,
         };
         candidates.set(key, { ...existing, ...patch, sources: [...new Set([...existing.sources, ...(patch.sources || [])])] });
@@ -208,8 +278,20 @@ function mergeAndScore({ trending, leaderboard, signals }) {
             sources: ["coingecko"],
         });
     }
+    for (const d of dexscreener) {
+        upsert(d.base_address, {
+            symbol: d.base_symbol || candidates.get(d.base_address)?.symbol,
+            name: d.base_name || candidates.get(d.base_address)?.name,
+            decimals: d.base_decimals ?? candidates.get(d.base_address)?.decimals ?? 18,
+            ds_volume_usd_h24: d.volume_usd_h24,
+            ds_liquidity_usd: d.liquidity_usd,
+            ds_mcap_usd: d.mcap_usd || d.fdv_usd,
+            ds_price_usd: d.price_usd,
+            sources: ["dexscreener"],
+        });
+    }
     for (const t of leaderboard) {
-        if (!t.address) continue;  // skip if no address resolution
+        if (!t.address) continue;
         upsert(t.address, {
             symbol: t.symbol || candidates.get(t.address)?.symbol,
             checkr_attention_pct: t.attention_pct,
@@ -231,20 +313,34 @@ function mergeAndScore({ trending, leaderboard, signals }) {
 
     // Score each candidate. Scale each axis to 0..1 then weighted sum.
     const arr = [...candidates.values()];
-    const maxVol = Math.max(...arr.map(c => c.cg_volume_usd_h24), 1);
+    if (arr.length === 0) return arr;
+    const maxCgVol = Math.max(...arr.map(c => c.cg_volume_usd_h24), 1);
+    const maxDsVol = Math.max(...arr.map(c => c.ds_volume_usd_h24), 1);
+    const maxLiq   = Math.max(...arr.map(c => c.ds_liquidity_usd), 1);
     const maxAtt = Math.max(...arr.map(c => c.checkr_attention_pct), 1);
     const maxSig = Math.max(...arr.map(c => c.checkr_signal_score), 1);
 
     for (const c of arr) {
-        const volScore = c.cg_volume_usd_h24 / maxVol;
+        // Combined volume score: max of CG-trending vs DexScreener (they
+        // measure the same underlying signal but have different coverage).
+        const volScore = Math.max(c.cg_volume_usd_h24 / maxCgVol, c.ds_volume_usd_h24 / maxDsVol);
+        const liqScore = c.ds_liquidity_usd / maxLiq;
         const attScore = c.checkr_attention_pct / maxAtt;
         const sigScore = c.checkr_signal_score / maxSig;
-        // Weights: volume (price discovery) 0.5, attention (catalyst) 0.3, signal (timing) 0.2
-        c.score = 0.5 * volScore + 0.3 * attScore + 0.2 * sigScore;
-        // Multi-source bonus: tokens that show up in both Coingecko AND Checkr get a 10% boost
-        const bothSources = c.sources.includes("coingecko") &&
-            c.sources.some(s => s.startsWith("checkr"));
-        if (bothSources) c.score *= 1.1;
+        // Weights: volume 0.40, liquidity 0.20, attention 0.25, signal 0.15.
+        // Volume dominates because price discovery > narrative; liquidity
+        // is a slippage proxy (we'll be selling into these); attention +
+        // signal are momentum/catalyst.
+        c.score = 0.40 * volScore + 0.20 * liqScore + 0.25 * attScore + 0.15 * sigScore;
+        // Multi-source bonus: tokens visible in 2+ source families get +10%.
+        const families = new Set();
+        for (const s of c.sources) {
+            if (s === "coingecko") families.add("cg");
+            else if (s === "dexscreener") families.add("ds");
+            else if (s.startsWith("checkr")) families.add("checkr");
+        }
+        if (families.size >= 2) c.score *= 1.10;
+        if (families.size >= 3) c.score *= 1.05;   // additional +5% for triple-confirmed
     }
     arr.sort((a, b) => b.score - a.score);
     return arr;
@@ -260,10 +356,11 @@ async function main() {
     if (args.dryRun) {
         console.log("== research.mjs DRY-RUN ==");
         console.log("Would call:");
-        console.log("  CoinGecko trending_pools (Base, 24h)        ~$0.01 USDC");
-        console.log("  Checkr leaderboard (24h, top 20)            ~$0.05 USDC");
-        console.log("  Checkr signal (top 10)                       ~$0.15 USDC");
-        console.log("  CoinGecko token_price (top 8 candidates)    ~$0.01 USDC");
+        console.log("  DexScreener token-pairs (USDC + WETH on Base)  free");
+        console.log("  CoinGecko trending_pools (Base, 24h)         ~$0.01 USDC");
+        console.log("  Checkr leaderboard (24h, top 20)             ~$0.05 USDC");
+        console.log("  Checkr signal (top 10)                        ~$0.15 USDC");
+        console.log("  CoinGecko token_price (top 8 candidates)     ~$0.01 USDC");
         console.log(`Top-N tokens to output: ${args.topN}`);
         console.log(`Total budget: <= $${args.maxSpendUsdc.toFixed(2)} USDC`);
         console.log(`Output path: ${args.out}`);
@@ -274,30 +371,49 @@ async function main() {
 
     const fetchPaid = makeFetchPaid(args.maxSpendUsdc);
 
-    console.log("== research.mjs LIVE ==  (signing x402 payments)");
+    console.log("== research.mjs LIVE ==  (signing x402 payments + free DexScreener calls)");
 
-    // Pull discovery sources in parallel.
-    const tasks = [cgTrendingBase(fetchPaid)];
-    if (!args.skipCheckr) tasks.push(checkrLeaderboard(fetchPaid), checkrSignals(fetchPaid));
-    let trending, leaderboard, signals;
+    // Pull discovery sources in parallel. DexScreener is free; everything
+    // else is x402-paid. We always call DexScreener so the basket has
+    // depth even if CoinGecko trending is shallow on the day.
+    const tasks = [];
+    const labels = [];
+    if (!args.skipDexscreener) { tasks.push(dexscreenerBaseLiquid()); labels.push("dexscreener"); }
+    tasks.push(cgTrendingBase(fetchPaid));                              labels.push("cg.trending");
+    if (!args.skipCheckr) {
+        tasks.push(checkrLeaderboard(fetchPaid));                       labels.push("checkr.leaderboard");
+        tasks.push(checkrSignals(fetchPaid));                           labels.push("checkr.signal");
+    }
+    let dexscreener = [], trending = [], leaderboard = [], signals = [];
+    const buckets = { dexscreener: [], "cg.trending": [], "checkr.leaderboard": [], "checkr.signal": [] };
     try {
         const results = await Promise.allSettled(tasks);
-        trending = results[0].status === "fulfilled" ? results[0].value : [];
-        leaderboard = !args.skipCheckr && results[1].status === "fulfilled" ? results[1].value : [];
-        signals    = !args.skipCheckr && results[2].status === "fulfilled" ? results[2].value : [];
         for (const [i, r] of results.entries()) {
-            if (r.status === "rejected") console.error(`  ${["cg.trending","checkr.leaderboard","checkr.signal"][i]} FAILED: ${r.reason?.message ?? r.reason}`);
+            const label = labels[i];
+            if (r.status === "rejected") {
+                console.error(`  ${label} FAILED: ${r.reason?.message ?? r.reason}`);
+            } else {
+                buckets[label] = r.value;
+                console.log(`  ${label}: ${r.value.length} candidates`);
+            }
         }
+        dexscreener = buckets.dexscreener;
+        trending    = buckets["cg.trending"];
+        leaderboard = buckets["checkr.leaderboard"];
+        signals     = buckets["checkr.signal"];
     } catch (e) {
         throw new Error(`discovery phase failed: ${e.message}`);
     }
-    if (trending.length === 0) {
-        throw new Error("CoinGecko trending returned no candidates — cannot build basket without a price-discovery source");
+    if (dexscreener.length + trending.length === 0) {
+        throw new Error("Both DexScreener AND CoinGecko returned no candidates — cannot build basket without a price-discovery source");
     }
 
     // Merge + score.
-    const ranked = mergeAndScore({ trending, leaderboard, signals });
-    const top = ranked.slice(0, Math.max(args.topN, 8));
+    const ranked = mergeAndScore({ trending, leaderboard, signals, dexscreener });
+    if (ranked.length < args.topN) {
+        console.warn(`WARN: only ${ranked.length} candidates after merge, requested ${args.topN}. Will return all available.`);
+    }
+    const top = ranked.slice(0, Math.max(args.topN, Math.min(ranked.length, 12)));
 
     // Bulk-fetch decimals + mcap for top candidates so we can validate addresses + tag tail tokens.
     const addrs = top.map(c => c.address).filter(Boolean);
@@ -310,23 +426,31 @@ async function main() {
         ...(prices[c.address] || {}),
     }));
 
-    const finalTokens = enriched.slice(0, args.topN).map(c => ({
-        symbol: c.symbol,
-        address: c.address,
-        decimals: c.decimals ?? 18,
-        tail: classifyTail(c.mcap_usd),
-        mcap_usd: c.mcap_usd ?? 0,
-        vol24_usd: c.vol24_usd ?? c.cg_volume_usd_h24 ?? 0,
-        attention_pct: c.checkr_attention_pct ?? 0,
-        signal_score: c.checkr_signal_score ?? 0,
-        score: Number(c.score.toFixed(4)),
-        sources: c.sources,
-    }));
+    const finalTokens = enriched.slice(0, args.topN).map(c => {
+        // Mcap precedence: CG-x402 token_price → DexScreener mcap → 0
+        const mcap = (c.mcap_usd ?? 0) || (c.ds_mcap_usd ?? 0) || 0;
+        // Vol precedence: CG-x402 vol → CG-trending vol → DexScreener vol
+        const vol = (c.vol24_usd ?? 0) || (c.cg_volume_usd_h24 ?? 0) || (c.ds_volume_usd_h24 ?? 0);
+        return {
+            symbol: c.symbol,
+            address: c.address,
+            decimals: c.decimals ?? 18,
+            tail: classifyTail(mcap),
+            mcap_usd: mcap,
+            vol24_usd: vol,
+            liquidity_usd: c.ds_liquidity_usd ?? 0,
+            attention_pct: c.checkr_attention_pct ?? 0,
+            signal_score: c.checkr_signal_score ?? 0,
+            score: Number(c.score.toFixed(4)),
+            sources: c.sources,
+        };
+    });
 
     const out = {
         tokens: finalTokens,
         research_summary: {
             n_candidates: ranked.length,
+            n_dexscreener: dexscreener.length,
             n_trending: trending.length,
             n_leaderboard: leaderboard.length,
             n_signals: signals.length,

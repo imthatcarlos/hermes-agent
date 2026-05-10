@@ -156,120 +156,122 @@ function renormalize(weights, tokenSymbols) {
     return Object.fromEntries(tokenSymbols.map(t => [t, (weights[t] ?? 0) / sum]));
 }
 
-// Apply caps in order: long-tail, single-asset, optional stable floor, then
-// renormalize. Each cap returns adjusted weights + adjustment notes.
+// Apply caps in a multi-pass loop until weights converge. Each pass runs
+// long-tail → single-asset (with optional vol weighting) → stable floor,
+// then renormalizes. We keep iterating because cap-then-redistribute can
+// push another token over its cap, requiring a second pass — without
+// iteration, a single pass would clip a token, then the message says
+// "X clipped to N%" but renormalization or a later cap could leave X
+// elsewhere, confusing observers.
 //
-// "Stable" tokens are detected dynamically from the basket via STABLE_PATTERN
-// (USDC/USDT/EURC/DAI/etc.) — no hardcoded symbols. The single-asset cap
-// excludes stables (they're meant to absorb excess). The stable-floor cap is
-// off by default in V1; pass --usdc-floor to turn it on, and it only fires
-// when at least one stable IS present in the basket.
+// Adjustment messages are emitted ONCE at the end, comparing the
+// pre-cap state to the post-convergence state. So messages always
+// reflect the actual final weights.
+//
+// "Stable" tokens are detected dynamically from the basket via
+// STABLE_PATTERN (USDC/USDT/EURC/DAI/etc.) — no hardcoded symbols.
 function applyCaps(weights, tokens, opts) {
     const tokenSymbols = tokens.map(t => t.symbol);
     const tailSet = new Set(tokens.filter(t => t.tail).map(t => t.symbol));
     const stableSet = new Set(findStables(tokens));
-    const adjustments = [];
-    let w = { ...weights };
-
-    // 1) Long-tail cap.
-    const tailSum = [...tailSet].reduce((a, t) => a + (w[t] ?? 0), 0);
-    if (tailSum > opts.maxLongtail + 1e-9) {
-        const excess = tailSum - opts.maxLongtail;
-        const scale = opts.maxLongtail / tailSum;
-        for (const t of tailSet) {
-            const before = w[t] ?? 0;
-            w[t] = before * scale;
-            if (before > 0) adjustments.push(
-                `${t} clipped ${(before * 100).toFixed(1)}% → ${(w[t] * 100).toFixed(1)}% (long-tail cap)`
-            );
-        }
-        // Redistribute excess to non-stable, non-tail tokens pro-rata.
-        const eligible = tokenSymbols.filter(t => !stableSet.has(t) && !tailSet.has(t));
-        const eligibleSum = eligible.reduce((a, t) => a + (w[t] ?? 0), 0);
-        if (eligibleSum > 0) {
-            for (const t of eligible) w[t] = (w[t] ?? 0) + excess * ((w[t] ?? 0) / eligibleSum);
-        } else if (eligible.length > 0) {
-            for (const t of eligible) w[t] = (w[t] ?? 0) + excess / eligible.length;
-        }
-    }
-
-    // 2) Single-asset cap (excluding stables — they're the cash sleeve).
-    //
-    // Per-token cap is min(maxSingle, volWeightCap) where volWeightCap is
-    // derived from a crude vol proxy if --vol-weight > 0. Vol proxy is
-    // 1 / sqrt(mcap_usd) — smaller mcap → higher expected vol → tighter
-    // cap. We also use 24h volume / mcap (turnover) when available;
-    // turnover > 50% of mcap suggests illiquid or wash-traded, tighten
-    // further. With --vol-weight 0 (default) the legacy maxSingle applies
-    // uniformly.
     const tokenByName = Object.fromEntries(tokens.map(t => [t.symbol, t]));
-    for (const tk of tokenSymbols) {
-        if (stableSet.has(tk)) continue;
-        let tokenCap = opts.maxSingle;
+    const initial = { ...weights };
+
+    function tokenCapFor(tk) {
+        if (stableSet.has(tk)) return 1;   // stables uncapped
+        let cap = opts.maxSingle;
         if (opts.volWeightK > 0) {
             const meta = tokenByName[tk] || {};
             const mcap = Math.max(meta.mcap_usd ?? 0, 1);
             const turnover = (meta.vol24_usd ?? 0) / mcap;
-            // Base vol proxy: $100M mcap reference yields cap ≈ volWeightK.
-            // Multiply by sqrt(mcap / $100M) so big-mcap tokens get a looser
-            // cap (clipped to maxSingle anyway) and small-mcap tokens get a
-            // tighter cap. Smaller mcap → less liquidity → tighter position.
             const volCap = opts.volWeightK * Math.sqrt(mcap / 1e8);
-            // Liquidity penalty: turnover > 50% halves the cap.
             const liqPenalty = turnover > 0.5 ? 0.5 : 1;
-            tokenCap = Math.min(tokenCap, volCap * liqPenalty);
+            cap = Math.min(cap, volCap * liqPenalty);
         }
-        if ((w[tk] ?? 0) > tokenCap + 1e-9) {
-            const before = w[tk];
-            const excess = before - tokenCap;
-            w[tk] = tokenCap;
-            const reason = opts.volWeightK > 0 ? "vol-weighted single-asset cap" : "single-asset cap";
-            adjustments.push(
-                `${tk} clipped ${(before * 100).toFixed(1)}% → ${(tokenCap * 100).toFixed(1)}% (${reason})`
-            );
-            // Donors: not the capped token, not stables, not tails.
-            // Tails are excluded so we don't re-inflate above the long-tail cap.
-            // Stables are excluded so their cash-sleeve role isn't loaded up.
-            const others = tokenSymbols.filter(t => t !== tk && !stableSet.has(t) && !tailSet.has(t));
-            const othersSum = others.reduce((a, t) => a + (w[t] ?? 0), 0);
-            if (othersSum > 0) {
-                for (const t of others) w[t] = (w[t] ?? 0) + excess * ((w[t] ?? 0) / othersSum);
-            } else if (others.length > 0) {
-                for (const t of others) w[t] = (w[t] ?? 0) + excess / others.length;
-            }
-        }
+        // Tail tokens are also bounded by the long-tail cap individually
+        // (their group sum is bounded separately) — give them at most the
+        // long-tail cap so a single tail token can't dominate even within
+        // the tail budget.
+        if (tailSet.has(tk)) cap = Math.min(cap, opts.maxLongtail);
+        return cap;
     }
 
-    // 3) Stable floor (opt-in via --usdc-floor; default 0 = disabled).
-    // Only fires when (a) the floor is > 0 AND (b) at least one stable is in
-    // the basket. We aggregate the floor across ALL stables in the basket and
-    // raise their combined weight to >= floor; donors are non-stable, non-tail.
-    if (opts.usdcFloor > 0 && stableSet.size > 0) {
-        const stables = [...stableSet];
-        const stableSum = stables.reduce((a, t) => a + (w[t] ?? 0), 0);
-        if (stableSum + 1e-9 < opts.usdcFloor) {
-            const shortfall = opts.usdcFloor - stableSum;
-            // Distribute floor pro-rata across stables (or evenly if all are 0).
-            if (stableSum > 0) {
-                for (const t of stables) w[t] = (w[t] ?? 0) + shortfall * ((w[t] ?? 0) / stableSum);
-            } else {
-                for (const t of stables) w[t] = (w[t] ?? 0) + shortfall / stables.length;
-            }
-            adjustments.push(
-                `stables (${stables.join("+")}) raised ${(stableSum * 100).toFixed(1)}% → ${(opts.usdcFloor * 100).toFixed(1)}% (stable floor)`
-            );
-            const donors = tokenSymbols.filter(t => !stableSet.has(t) && !tailSet.has(t));
-            const donorsSum = donors.reduce((a, t) => a + (w[t] ?? 0), 0);
-            if (donorsSum > 0) {
-                for (const t of donors) w[t] = Math.max(0, (w[t] ?? 0) - shortfall * ((w[t] ?? 0) / donorsSum));
-            } else if (donors.length > 0) {
-                for (const t of donors) w[t] = Math.max(0, (w[t] ?? 0) - shortfall / donors.length);
+    function onePass(w) {
+        let didChange = false;
+
+        // 1) Long-tail group cap.
+        const tailSum = [...tailSet].reduce((a, t) => a + (w[t] ?? 0), 0);
+        if (tailSum > opts.maxLongtail + 1e-9) {
+            const scale = opts.maxLongtail / tailSum;
+            for (const t of tailSet) w[t] = (w[t] ?? 0) * scale;
+            didChange = true;
+        }
+
+        // 2) Per-token (single-asset, optionally vol-weighted) cap.
+        for (const tk of tokenSymbols) {
+            const cap = tokenCapFor(tk);
+            if ((w[tk] ?? 0) > cap + 1e-9) {
+                w[tk] = cap;
+                didChange = true;
             }
         }
+
+        // 3) Stable floor (opt-in).
+        if (opts.usdcFloor > 0 && stableSet.size > 0) {
+            const stables = [...stableSet];
+            const stableSum = stables.reduce((a, t) => a + (w[t] ?? 0), 0);
+            if (stableSum + 1e-9 < opts.usdcFloor) {
+                const shortfall = opts.usdcFloor - stableSum;
+                if (stableSum > 0) {
+                    for (const t of stables) w[t] = (w[t] ?? 0) + shortfall * ((w[t] ?? 0) / stableSum);
+                } else {
+                    for (const t of stables) w[t] = (w[t] ?? 0) + shortfall / stables.length;
+                }
+                didChange = true;
+            }
+        }
+
+        // 4) Renormalize so weights always sum to 1.
+        const renorm = renormalize(w, tokenSymbols);
+        for (const t of tokenSymbols) {
+            if (Math.abs((renorm[t] ?? 0) - (w[t] ?? 0)) > 1e-9) didChange = true;
+            w[t] = renorm[t];
+        }
+        return didChange;
     }
 
-    // 4) Final renormalization to exactly 1.0.
-    return { weights: renormalize(w, tokenSymbols), adjustments };
+    let w = { ...weights };
+    let iter = 0;
+    while (iter < 12) {
+        iter++;
+        if (!onePass(w)) break;
+    }
+
+    // Build adjustment messages from initial → final, citing which caps
+    // appear to have been the binding constraint.
+    const adjustments = [];
+    for (const tk of tokenSymbols) {
+        const before = initial[tk] ?? 0;
+        const after = w[tk] ?? 0;
+        if (Math.abs(after - before) < 0.005) continue;   // skip < 0.5pp moves
+        const reasons = [];
+        const cap = tokenCapFor(tk);
+        if (Math.abs(after - cap) < 0.005 && before > cap + 1e-9) {
+            reasons.push(opts.volWeightK > 0 && !stableSet.has(tk) && !tailSet.has(tk) ? "vol-weighted cap" : "single-asset cap");
+        }
+        if (tailSet.has(tk) && (before > opts.maxLongtail || after < before)) {
+            reasons.push("long-tail cap");
+        }
+        if (stableSet.has(tk) && opts.usdcFloor > 0 && after > before) {
+            reasons.push("stable floor");
+        }
+        if (!reasons.length) reasons.push("redistribution");
+        adjustments.push(
+            `${tk}: ${(before * 100).toFixed(1)}% → ${(after * 100).toFixed(1)}% (${reasons.join(", ")})`
+        );
+    }
+
+    return { weights: w, adjustments, iterations: iter };
 }
 
 function validatePersona(persona, tokenSymbols, fileLabel) {
@@ -319,10 +321,34 @@ function main() {
         volWeightK: args.volWeightK,
     });
 
+    // Emit weights both as a {symbol:value} map (human-readable) and as
+    // ordered arrays in basket order. The arrays are what `sherwood
+    // strategy propose portfolio` wants: --tokens csv-of-addresses
+    // --weights csv-of-bps. Ordered arrays remove the "did you preserve
+    // basket order?" footgun from the SKILL.md invocation.
+    const weights_bps_ordered = tokens.map(t => Math.round((weights[t.symbol] ?? 0) * 10000));
+    const addresses_ordered = tokens.map(t => t.address);
+    const tokens_ordered = tokens.map(t => t.symbol);
+
+    // Sanity: bps must sum to 10000 ± rounding noise.
+    const bpsSum = weights_bps_ordered.reduce((a, b) => a + b, 0);
+    if (Math.abs(bpsSum - 10000) > 5) {
+        console.error(`warning: weights_bps_ordered sum is ${bpsSum}, expected 10000 ± 5`);
+    }
+    // Fix rounding drift by adjusting the largest weight by the delta.
+    if (bpsSum !== 10000 && weights_bps_ordered.length > 0) {
+        const drift = 10000 - bpsSum;
+        const largestIdx = weights_bps_ordered.indexOf(Math.max(...weights_bps_ordered));
+        weights_bps_ordered[largestIdx] += drift;
+    }
+
     const result = {
         weights: Object.fromEntries(
             Object.entries(weights).map(([k, v]) => [k, Number(v.toFixed(4))])
         ),
+        weights_bps_ordered,
+        addresses_ordered,
+        tokens_ordered,
         adjustments,
         persona_notes: personaNotes,
         by_persona_normalized: Object.fromEntries(

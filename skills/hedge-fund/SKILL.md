@@ -217,30 +217,61 @@ Post a markdown table to chat showing the final weights, the source of
 each token (research provenance from basket.json), and any adjustments
 the Risk Manager made.
 
-### Step 6 — Vault diff
+### Step 6 — Vault diff + capital check
 
-Read the vault's current holdings and compute deltas vs target.
+Read the vault's current holdings + USDC balance.
 
 ```bash
-sherwood vault info zerohumanfund | jq '.balances'
+VAULT_INFO=$(sherwood vault info zerohumanfund)
+echo "$VAULT_INFO" | jq '.balances'
+VAULT_USDC=$(echo "$VAULT_INFO" | jq -r '.balances.USDC // "0"')
+AGENT_ADDR=$(sherwood config show | jq -r '.address')
+AGENT_USDC=$(sherwood vault balance --address "$AGENT_ADDR" --token USDC 2>/dev/null \
+    || cast call "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" "balanceOf(address)(uint256)" "$AGENT_ADDR" --rpc-url "$BASE_RPC_URL")
 ```
 
 Compute `target_usd - current_usd` per token, post a deltas summary to
-chat (which tokens the proposal would buy/sell and roughly how much).
+chat. Then check whether the vault has enough capital to make the
+proposal meaningful:
+
+- **If `VAULT_USDC == 0` AND user has not authorized a deposit:** post
+  a clear chat message — "Vault is empty. The proposal will execute
+  against $0, doing nothing on-chain. Deposit USDC into the vault
+  first, or skip this cycle." Then **abort**. Do not silently submit a
+  proposal that can't deploy.
+- **If `VAULT_USDC > 0`:** continue to Step 6.5 only if `--dry-run`,
+  otherwise straight to Step 7.
+- **If `VAULT_USDC == 0` BUT the agent wallet has USDC AND the user
+  said `deposit-and-propose`:** insert Step 6.5 (deposit) before
+  Step 7.
 
 **If invoked with `--dry-run`: stop here.** Post a "dry-run complete"
 message and exit cleanly.
 
+### Step 6.5 — (Optional) Deposit agent USDC into the vault
+
+Only runs when the user explicitly asked to deposit. Confirms once
+more before any on-chain transfer.
+
+```bash
+# Confirm with the user first:
+#   "Deposit X USDC from agent wallet into zerohumanfund vault? (yes/no)"
+sherwood vault deposit zerohumanfund --amount "$DEPOSIT_AMOUNT" --token USDC --execute
+sherwood vault info zerohumanfund | jq '.balances.USDC'
+```
+
+After deposit, refresh `VAULT_USDC` and continue.
+
 ### Step 7 — User confirmation (REQUIRED before proposal)
 
-`sherwood proposal create` writes on-chain and pins to IPFS. Per
+`sherwood strategy propose` writes on-chain and pins to IPFS. Per
 Sherwood's own SKILL.md: gas is paid and the proposal cannot be edited
 once it enters the voting window. **Always require explicit confirmation
 in chat before this step.**
 
 Ask the user:
 ```
-Submit Sherwood PortfolioStrategy proposal for zerohumanfund with the target weights above? (yes / no)
+Submit Sherwood portfolio-strategy proposal for zerohumanfund with the target weights above? Vault holds $VAULT_USDC USDC, which is what will be deployed. (yes / no)
 ```
 
 Wait for an affirmative reply (`yes`, `proceed`, `confirm`). On `no` or
@@ -248,13 +279,41 @@ anything else, post "Cycle ended without proposal." and exit.
 
 ### Step 8 — Submit the proposal
 
+The Sherwood CLI surface for portfolio-template proposals is
+`sherwood strategy propose portfolio` (NOT `sherwood proposal create`).
+The `strategy propose` form clones the template, builds the execute +
+settle calldata, and submits the proposal in one call.
+
+Pull the ordered token addresses + bps weights directly from
+`target-weights.json` (the aggregator emits them in basket order so
+weight[i] aligns with token[i]):
+
 ```bash
-sherwood proposal create \
-    --syndicate zerohumanfund \
-    --strategy portfolio \
-    --weights @target-weights.json \
+VAULT_ADDR=$(sherwood vault info zerohumanfund | jq -r '.address')
+TOKENS_CSV=$(jq -r '.addresses_ordered | join(",")' target-weights.json)
+WEIGHTS_BPS_CSV=$(jq -r '.weights_bps_ordered | join(",")' target-weights.json)
+TOKEN_LIST=$(jq -r '.tokens_ordered | join(", ")' target-weights.json)
+DEPLOY_AMOUNT=$VAULT_USDC   # whatever the vault currently holds in USDC base units
+
+sherwood strategy propose portfolio \
+    --vault "$VAULT_ADDR" \
+    --tokens "$TOKENS_CSV" \
+    --weights "$WEIGHTS_BPS_CSV" \
+    --amount "$DEPLOY_AMOUNT" \
+    --asset USDC \
+    --name "ZHF-$CYCLE_ID" \
+    --description "Persona-debate basket: $TOKEN_LIST" \
+    --performance-fee 0 \
     --duration 7d
 ```
+
+> **If the CLI rejects any flag**, run `sherwood strategy propose portfolio --help`
+> from the container and reconcile. Flag names have shifted across
+> Sherwood versions; the agent should update its invocation rather
+> than retry the same broken call. Likely variants: `--asset` may be
+> `--vault-asset`; `--weights` may want decimals not bps in some
+> versions; `--amount` is in the asset's base units (USDC = 6 decimals,
+> so $10 = 10000000).
 
 Capture the proposal id and Basescan link. Post to chat:
 ```bash
