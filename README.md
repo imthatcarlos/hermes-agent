@@ -45,7 +45,8 @@ syndicate's public XMTP chat — that's the showcase.
 │       │   └── pm.md                # confidence-weighted aggregation reference
 │       └── scripts/
 │           ├── research.mjs         # x402 token discovery (CoinGecko + Checkr Social) — produces basket.json
-│           ├── aggregate.mjs        # PM + Risk Manager (deterministic)
+│           ├── cycle.mjs            # persona-round orchestrator — 1 isolated LLM call per persona via gateway
+│           ├── aggregate.mjs        # PM + Risk Manager (deterministic, vol-weighted single-asset cap)
 │           ├── package.json         # @x402/fetch + @x402/evm + viem (installed at container build)
 │           └── tokens.json          # legacy static fallback — not loaded in V1
 ├── solana-swaps/                    # legacy git submodule, reference for Hermes SKILL.md format — not loaded into the new container

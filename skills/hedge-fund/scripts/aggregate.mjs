@@ -53,6 +53,11 @@ function parseArgs(argv) {
         maxSingle: 0.5,
         maxLongtail: 0.10,
         usdcFloor: 0,
+        // Vol-weighted single-asset cap. If enabled, the per-token cap is
+        // min(maxSingle, volWeightK / vol_proxy). Higher-vol tokens get a
+        // smaller cap (rough volatility proxy: smaller mcap → higher
+        // expected vol → tighter cap). Set to 0 to disable.
+        volWeightK: 0,
     };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
@@ -65,6 +70,7 @@ function parseArgs(argv) {
             case "--max-single":  args.maxSingle = parseFloat(argv[++i]); break;
             case "--max-longtail":args.maxLongtail = parseFloat(argv[++i]); break;
             case "--usdc-floor":  args.usdcFloor = parseFloat(argv[++i]); break;
+            case "--vol-weight":  args.volWeightK = parseFloat(argv[++i]); break;
             default:
                 throw new Error(`unknown arg: ${a}`);
         }
@@ -188,14 +194,38 @@ function applyCaps(weights, tokens, opts) {
     }
 
     // 2) Single-asset cap (excluding stables — they're the cash sleeve).
+    //
+    // Per-token cap is min(maxSingle, volWeightCap) where volWeightCap is
+    // derived from a crude vol proxy if --vol-weight > 0. Vol proxy is
+    // 1 / sqrt(mcap_usd) — smaller mcap → higher expected vol → tighter
+    // cap. We also use 24h volume / mcap (turnover) when available;
+    // turnover > 50% of mcap suggests illiquid or wash-traded, tighten
+    // further. With --vol-weight 0 (default) the legacy maxSingle applies
+    // uniformly.
+    const tokenByName = Object.fromEntries(tokens.map(t => [t.symbol, t]));
     for (const tk of tokenSymbols) {
         if (stableSet.has(tk)) continue;
-        if ((w[tk] ?? 0) > opts.maxSingle + 1e-9) {
+        let tokenCap = opts.maxSingle;
+        if (opts.volWeightK > 0) {
+            const meta = tokenByName[tk] || {};
+            const mcap = Math.max(meta.mcap_usd ?? 0, 1);
+            const turnover = (meta.vol24_usd ?? 0) / mcap;
+            // Base vol proxy: $100M mcap reference yields cap ≈ volWeightK.
+            // Multiply by sqrt(mcap / $100M) so big-mcap tokens get a looser
+            // cap (clipped to maxSingle anyway) and small-mcap tokens get a
+            // tighter cap. Smaller mcap → less liquidity → tighter position.
+            const volCap = opts.volWeightK * Math.sqrt(mcap / 1e8);
+            // Liquidity penalty: turnover > 50% halves the cap.
+            const liqPenalty = turnover > 0.5 ? 0.5 : 1;
+            tokenCap = Math.min(tokenCap, volCap * liqPenalty);
+        }
+        if ((w[tk] ?? 0) > tokenCap + 1e-9) {
             const before = w[tk];
-            const excess = before - opts.maxSingle;
-            w[tk] = opts.maxSingle;
+            const excess = before - tokenCap;
+            w[tk] = tokenCap;
+            const reason = opts.volWeightK > 0 ? "vol-weighted single-asset cap" : "single-asset cap";
             adjustments.push(
-                `${tk} clipped ${(before * 100).toFixed(1)}% → ${(opts.maxSingle * 100).toFixed(1)}% (single-asset cap)`
+                `${tk} clipped ${(before * 100).toFixed(1)}% → ${(tokenCap * 100).toFixed(1)}% (${reason})`
             );
             // Donors: not the capped token, not stables, not tails.
             // Tails are excluded so we don't re-inflate above the long-tail cap.
@@ -286,6 +316,7 @@ function main() {
         maxSingle: args.maxSingle,
         maxLongtail: args.maxLongtail,
         usdcFloor: args.usdcFloor,
+        volWeightK: args.volWeightK,
     });
 
     const result = {

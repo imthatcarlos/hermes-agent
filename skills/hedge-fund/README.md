@@ -44,7 +44,8 @@ skills/hedge-fund/
 │   └── pm.md                        # confidence-weighted aggregation reference
 └── scripts/
     ├── research.mjs                 # x402 discovery (CoinGecko + Checkr) — produces basket.json
-    ├── aggregate.mjs                # PM + Risk Manager (deterministic)
+    ├── cycle.mjs                    # persona-round orchestrator (1 LLM call per persona; ≥2-persona threshold)
+    ├── aggregate.mjs                # PM + Risk Manager (deterministic; vol-weighted single-asset cap optional)
     ├── tokens.json                  # legacy static fallback — not loaded in V1
     └── package.json                 # @x402/fetch + @x402/evm + viem (installed at container build)
 ```
@@ -58,21 +59,32 @@ Per-cycle artifacts go to
 
 ## Cycle flow (as orchestrated by SKILL.md)
 
-1. Preflight (sherwood + syndicate registration).
+1. Preflight: sherwood + syndicate registration + `sherwood strategy
+   list | grep portfolio` (catch wrong strategy name early).
 2. Open cycle, post header to XMTP.
 3. **Discover basket** via `scripts/research.mjs` (x402 calls). Output
    `cycles/<id>/basket.json`. Post a research card to chat.
-4. Three persona LLM calls (Buffett → Wood → Burry); each receives the
-   dynamic basket + research metadata, emits a JSON object with
-   `signal` + `confidence` per token. Each posted to XMTP as a card.
-5. Run `aggregate.mjs --tokens basket.json` (signals → weights, caps
-   applied); post target weights + adjustments to XMTP.
+4. **Persona round via `scripts/cycle.mjs`** — one isolated LLM call
+   per persona through the Hermes gateway. Each persona's prompt
+   includes the lens template + the basket as a markdown table with
+   per-token research metadata (mcap, vol, attention, signal, sources)
+   so personas cite concrete numbers. Auto-retries on JSON validation
+   errors; aborts the cycle if < 2 personas produce valid signals.
+5. Run `aggregate.mjs --tokens basket.json --vol-weight 0.5` (signals
+   → weights, caps + vol-weighted sizing applied); post target weights
+   + adjustments to XMTP.
 6. Read vault; post deltas to XMTP.
 7. **Stop here on `--dry-run`.**
 8. Confirm with user in chat.
 9. `sherwood proposal create --strategy portfolio --weights @target-weights.json`.
 10. Post Basescan link to XMTP. Sherwood plugin auto-posts approval/
     execution lifecycle from there.
+11. **After settlement** (days later, async): Sherwood plugin emits a
+    `<sherwood-settlement>` block with a `REMEMBER THIS` marker. Persist
+    cycle outcome (basket, weights, signals, P&L, lesson) via the
+    Hermes `memory` tool tagged `hedge-fund` + `zerohumanfund`. Future
+    cycles recall the last 4 weeks at preflight and feed it to personas
+    so the fund actually learns over time.
 
 ## Cost per cycle (x402)
 
@@ -126,9 +138,10 @@ AGENT_PRIVATE_KEY=$AGENT_PRIVATE_KEY node research.mjs --dry-run
 
 | Cap | Default | What it does |
 |---|---|---|
-| `--max-single` | 0.50 | No single non-stable asset > 50% |
+| `--max-single` | 0.50 | No single non-stable asset > 50% (uniform cap) |
 | `--max-longtail` | 0.10 | All `tail: true` tokens combined ≤ 10% |
 | `--usdc-floor` | 0 | **Stable floor disabled in V1.** Pass `--usdc-floor 0.10` to enforce a 10% combined stable position (USDC/USDT/EURC/DAI/etc., detected dynamically from the basket). |
+| `--vol-weight` | 0 | **Vol-weighted single-asset cap.** Pass e.g. `--vol-weight 0.5` to add a per-token cap of `min(maxSingle, 0.5 * sqrt(mcap_usd / $100M))`. Big-mcap tokens stay at maxSingle; small-mcap tokens get a tighter cap (a $1M-mcap token caps near 5%). Plus a 50% liquidity penalty when 24h-vol/mcap > 0.5 (catches wash trading / illiquid). SKILL.md V1 enables this with K=0.5. |
 
 "Stable" tokens are detected by symbol pattern (`USDC|USDT|EURC|DAI|FRAX|USDe|...`) or by an explicit `stable: true` flag in the basket JSON. The hardcoded "USDC" assumption from V0 is gone — the dynamic basket may have any stable, or none.
 

@@ -61,6 +61,15 @@ sherwood identity status || echo "FAIL: no Sherwood identity"
 sherwood syndicate info zerohumanfund | jq -r '.agents[]?' \
     | grep -i "$(sherwood config show | jq -r '.address')" \
     || echo "FAIL: agent wallet not registered with zerohumanfund"
+
+# Verify the strategy template name we'll use in Step 8 actually exists on
+# this network. The template name has shifted across Sherwood versions
+# ("portfolio", "portfolio-v3", "aerodrome-lp" all surface in different
+# releases). Reading from `sherwood strategy list` once at preflight
+# catches a misnamed --strategy flag before we burn 6 personas + research
+# spend on a cycle that can't submit.
+sherwood strategy list | grep -E '^\s*portfolio\b' \
+    || echo "FAIL: 'portfolio' strategy template not found — run 'sherwood strategy list' to find the current name and update Step 8"
 ```
 
 If any FAIL: post a single concise message to the syndicate chat naming
@@ -124,58 +133,75 @@ empty), **abort the cycle** and post the failure to chat — do not
 silently fall back to the static `scripts/tokens.json` (which is
 boilerplate and would mislead observers).
 
-### Step 4 — Persona round
+### Step 4 — Persona round (delegated to `scripts/cycle.mjs`)
 
-For each of `buffett`, `wood`, `burry` in that order:
+The persona round is **not** done in this LLM turn. Instead, shell out
+to `scripts/cycle.mjs`, which makes one isolated LLM call per persona
+through the Hermes OpenAI-compatible gateway. Each persona gets a clean
+context, the full lens prompt, and the basket + per-token research
+metadata literally injected as a markdown table — so e.g. Burry can
+cite `mcap=$3.0B, vol=$80M, attention=4.2%` instead of guessing.
 
-1. Read `personas/<name>.md` (the lens template for this persona).
-2. Read the dynamic basket: `cat cycles/$CYCLE_ID/basket.json`.
-3. Build the persona prompt by combining: the persona's system prompt +
-   crypto-context section, the basket as a JSON list of symbols +
-   addresses, and the per-token research metadata (mcap, 24h vol,
-   attention, signal score, sources).
-4. Generate the persona's view as a JSON object with one entry per
-   token in the basket — `signal` ∈ `{"bullish","bearish","neutral"}`,
-   `confidence` 0–100, `reasoning` ≤ 240 chars. No prose outside JSON.
-   ```json
-   {
-     "persona": "warren-buffett",
-     "signals": [
-       {"token":"<sym1>","signal":"...","confidence":...,"reasoning":"..."},
-       {"token":"<sym2>","signal":"...","confidence":...,"reasoning":"..."},
-       ...
-     ]
-   }
-   ```
-5. Validate: all basket tokens present in the same order; signals in
-   the allowed set; confidence in [0, 100]; reasoning ≤ 240 chars.
-   If invalid, retry once with an explicit "emit only the JSON object,
-   no prose" instruction. If invalid twice, skip the persona (note in
-   the next chat post) and continue.
-6. Write the JSON to `cycles/$CYCLE_ID/signals/<name>.json`.
-7. Post a short markdown card to the syndicate chat (one row per
-   token in the basket).
+Why split it out: a single LLM turn that role-plays 3 personas in
+sequence (each emitting strict JSON) drifts on schemas and forgets
+constraints by the third pass. Per-persona isolated calls eliminate
+that failure mode.
+
+```bash
+cd /opt/data/skills/finance/hedge-fund
+node scripts/cycle.mjs \
+    --basket "cycles/$CYCLE_ID/basket.json" \
+    --personas buffett wood burry \
+    --personas-dir personas \
+    --out-dir "cycles/$CYCLE_ID/signals" \
+    --gateway-url "${API_SERVER_URL:-http://127.0.0.1:8642}" \
+    --gateway-key "$API_SERVER_KEY" \
+    --model "$HERMES_MODEL"
+```
+
+Behavior:
+- One LLM call per persona, executed sequentially.
+- Each response is parsed; if JSON is wrapped in markdown fences,
+  unwrapped automatically. Schema violations trigger one retry with
+  a corrective hint. If still invalid, the persona is skipped.
+- Writes one `signals/<name>.json` per valid persona.
+- Writes a manifest `cycles/<id>/persona-round.json` summarizing
+  which personas succeeded vs failed.
+- **Exits non-zero if fewer than 2 personas produced valid signals.**
+  This makes the skill abort the cycle rather than letting one persona
+  drive the consensus alone.
+
+After cycle.mjs returns successfully, post a markdown card per valid
+persona to the syndicate chat (one row per basket token, columns:
+signal, confidence, rationale). Read the manifest to know which
+signal files to use in Step 5.
 
 ### Step 5 — Risk Manager + PM aggregation
 
-Run the deterministic aggregator. Pass the dynamic basket from Step 3
-as the `--tokens` source.
+Run the deterministic aggregator. Use the signal files listed in the
+manifest from Step 4.
 
 ```bash
 cd /opt/data/skills/finance/hedge-fund/cycles/$CYCLE_ID
 node ../../scripts/aggregate.mjs \
-    --signals signals/buffett.json signals/wood.json signals/burry.json \
+    --signals $(jq -r '.signal_files | join(" ")' persona-round.json) \
     --tokens basket.json \
     --max-single 0.5 \
     --max-longtail 0.10 \
+    --vol-weight 0.5 \
     --out target-weights.json
 ```
 
-The default risk caps in V1: `--max-single 0.5` (no single non-stable
-asset > 50%), `--max-longtail 0.10` (sum of `tail:true` tokens ≤ 10%),
-**no stable floor** (the basket may not contain any stable; pass
-`--usdc-floor 0.10` if you've confirmed a stable is present and want
-to enforce a cash sleeve).
+The default risk caps in V1:
+- `--max-single 0.5` — no single non-stable asset > 50%.
+- `--max-longtail 0.10` — sum of `tail:true` tokens ≤ 10%.
+- `--vol-weight 0.5` — vol-weighted single-asset cap on top of
+  `--max-single`. Per-token cap = min(0.5, 0.5 / sqrt(mcap_usd / $100M)),
+  with a 50% liquidity penalty if 24h-volume / mcap > 0.5. Smaller
+  mcap → tighter cap. Set to 0 to disable and use plain --max-single.
+- No stable floor by default (the basket may not contain any stable;
+  pass `--usdc-floor 0.10` if you've confirmed a stable is present
+  and want to enforce a cash sleeve).
 
 Output (`target-weights.json`):
 ```json
@@ -243,6 +269,27 @@ The Sherwood Hermes plugin auto-posts proposal-lifecycle summaries
 (approved / executed / settled) to the chat — no further work needed
 from this skill.
 
+### Step 9 — Persist cycle memory (after settlement)
+
+After the syndicate settles the proposal (days later, asynchronously),
+the Sherwood Hermes plugin emits a `<sherwood-settlement>` block in
+your context with a `REMEMBER THIS` marker. **Always honor the marker**
+by writing a memory entry that captures:
+
+- `cycle_id`, basket symbols + addresses, target weights vs realized,
+  per-persona signals + confidences, P&L on settlement, fee paid.
+- A 1-line lesson ("AERO outperformed despite Burry's bearish call
+  with confidence 80 — recalibrate Burry's DEX-governance prior").
+
+Use the Hermes `memory` tool. Tag entries with `hedge-fund` and
+`zerohumanfund` so they're easy to recall in future cycles. Future
+cycles should `memory recall --tags hedge-fund` at preflight and
+include the last 4 weeks of summaries in the persona context — the
+personas can then reason about regime ("we held VIRTUAL last 3 weeks
+and it underperformed; downweight").
+
+This loop is what turns the demo into something that actually compounds.
+
 ## Safety rules
 
 1. **NEVER** echo `AGENT_PRIVATE_KEY` to chat or logs.
@@ -271,7 +318,8 @@ from this skill.
 - `personas/risk-manager.md` — deterministic concentration-cap reference (this skill's adaptation).
 - `personas/pm.md` — confidence-weighted aggregation reference (this skill's adaptation).
 - `scripts/research.mjs` — discovery via x402 (CoinGecko trending pools + Checkr Social leaderboard + signal radar). ~$0.22 USDC/cycle.
-- `scripts/aggregate.mjs` — Risk Manager + PM, deterministic.
+- `scripts/cycle.mjs` — persona-round orchestrator. Calls the Hermes gateway once per persona with isolated context + injected basket metadata; validates JSON; writes signal files + manifest. Exits non-zero if < 2 personas produce valid signals.
+- `scripts/aggregate.mjs` — Risk Manager + PM, deterministic. Supports vol-weighted single-asset cap (`--vol-weight K`).
 - `scripts/package.json` — declares `@x402/fetch` + `@x402/evm` + `viem` for `research.mjs`. Installed at container build via Dockerfile.
 - `scripts/tokens.json` — static fallback basket (legacy boilerplate); **not used in V1** when research.mjs succeeds.
 - `README.md` — skill-level overview + provenance + x402 cost notes.

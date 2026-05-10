@@ -75,12 +75,34 @@ function makeFetchPaid(maxSpendUsdc) {
 }
 
 async function fetchJson(label, url, fetchPaid) {
-    const r = await fetchPaid(url);
+    let r;
+    try {
+        r = await fetchPaid(url);
+    } catch (e) {
+        // x402-fetch v2 throws on payment-related failures (insufficient
+        // USDC, signature reject, header version mismatch, etc.). Surface a
+        // clear message naming the most likely causes first.
+        const msg = e?.message || String(e);
+        const hints = [];
+        if (/exceeds maximum allowed/i.test(msg)) hints.push("the endpoint demanded more USDC than --max-spend-usdc allows; raise the cap if you trust it");
+        if (/insufficient/i.test(msg)) hints.push("agent wallet may be out of USDC on Base — fund it");
+        if (/PAYMENT-SIGNATURE|X-PAYMENT/i.test(msg)) hints.push("possible v1↔v2 x402 header mismatch — try downgrading to x402-fetch@^1.x if the upstream API expects PAYMENT-SIGNATURE");
+        throw new Error(`${label} → ${msg}${hints.length ? `\n  hint: ${hints.join("; ")}` : ""}`);
+    }
     if (!r.ok) throw new Error(`${label} → HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
     return r.json();
 }
 
 // ---- CoinGecko: trending pools on Base (24h) ----
+//
+// We filter to pools quoted in stables (USDC, USDT, EURC, etc.) so we only
+// surface token candidates with a USD-denominated price reference for
+// downstream rebalancing — and so we don't accidentally grade a stablecoin
+// pair (USDC/USDT) as a "hot pick." We also filter out base tokens whose
+// symbol IS a stable (the base side of WETH/USDC is WETH, but if we somehow
+// see USDC/USDT the base is USDC and gets dropped here too).
+const STABLE_QUOTE_PATTERN = /^(USDC|USDT|EURC|DAI|FRAX|USDe|PYUSD|GUSD|TUSD|crvUSD|sDAI)$/i;
+
 async function cgTrendingBase(fetchPaid) {
     const url = `${COINGECKO_BASE}/onchain/networks/base/trending_pools?page=1&duration=24h&include=base_token,quote_token,dex`;
     const data = await fetchJson("cg.trending", url, fetchPaid);
@@ -102,7 +124,14 @@ async function cgTrendingBase(fetchPaid) {
             volume_usd_h24: parseFloat(pool.attributes?.volume_usd?.h24 || "0"),
             price_change_h24: parseFloat(pool.attributes?.price_change_percentage?.h24 || "0"),
         };
-    }).filter(p => p.base_address);  // require an address
+    }).filter(p => {
+        if (!p.base_address) return false;
+        // Must be quoted in a stable so we have a USD price reference.
+        if (!p.quote_symbol || !STABLE_QUOTE_PATTERN.test(p.quote_symbol)) return false;
+        // Drop pools whose base side is itself a stable (stable/stable pairs).
+        if (p.base_symbol && STABLE_QUOTE_PATTERN.test(p.base_symbol)) return false;
+        return true;
+    });
 }
 
 // ---- CoinGecko: bulk token data by address (decimals + mcap + vol) ----
