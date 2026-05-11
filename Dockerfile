@@ -43,12 +43,19 @@ WORKDIR /app
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 
-# Install hermes agent to /opt (outside ~/.hermes volume mount)
-RUN git clone https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent \
-    && cd /opt/hermes-agent \
-    && uv venv venv \
-    && uv pip install --python venv/bin/python -e ".[all]" \
-    && ln -sf /opt/hermes-agent/venv/bin/hermes /usr/local/bin/hermes
+# Install hermes agent to /opt (outside ~/.hermes volume mount).
+# Two ways to reach the binary so `railway ssh` sessions always find it:
+#   1. /usr/local/bin/hermes symlink — picked up by any shell whose PATH
+#      includes /usr/local/bin (the default on Debian).
+#   2. /etc/profile.d/hermes.sh — exports the venv bin dir to PATH for
+#      login shells, in case the symlink ever breaks.
+RUN git clone https://github.com/NousResearch/hermes-agent.git /opt/hermes \
+    && cd /opt/hermes \
+    && uv venv .venv \
+    && uv pip install --python .venv/bin/python -e ".[all]" \
+    && ln -sf /opt/hermes/.venv/bin/hermes /usr/local/bin/hermes \
+    && echo 'export PATH="/opt/hermes/.venv/bin:$PATH"' > /etc/profile.d/hermes.sh \
+    && chmod +x /etc/profile.d/hermes.sh
 
 WORKDIR /app
 

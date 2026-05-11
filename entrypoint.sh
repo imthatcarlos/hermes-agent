@@ -3,6 +3,9 @@
 echo "=== Hermes Agent Entrypoint ==="
 echo "Date: $(date)"
 
+# Make `hermes` resolvable regardless of /usr/local/bin symlink state.
+export PATH="/opt/hermes/.venv/bin:$PATH"
+
 mkdir -p /app/workspace
 
 # Symlink Sherwood Fund into the volume-mounted ~/.hermes (anything baked into
