@@ -57,6 +57,11 @@ RUN git clone https://github.com/NousResearch/hermes-agent.git /opt/hermes \
     && echo 'export PATH="/opt/hermes/.venv/bin:$PATH"' > /etc/profile.d/hermes.sh \
     && chmod +x /etc/profile.d/hermes.sh
 
+# Allow `hermes gateway run` as root. This container runs entirely as root
+# (no separate `hermes` user), so the upstream safety check would otherwise
+# block the gateway from starting. HERMES_HOME stays root-owned consistently.
+ENV HERMES_ALLOW_ROOT_GATEWAY=1
+
 WORKDIR /app
 
 # Copy and setup entrypoint script
