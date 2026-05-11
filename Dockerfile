@@ -67,14 +67,6 @@ RUN chmod +x /app/entrypoint.sh
 RUN mkdir -p /root/.hermes /app/workspace
 WORKDIR /app/workspace
 
-# Install Sherwood Fund dashboard plugin to /opt (outside ~/.hermes volume mount).
-# entrypoint.sh symlinks /opt/hermes-fund/* into ~/.hermes/{plugins,dashboard-themes}/
-# at runtime, since the volume shadows anything baked into /root/.hermes here.
-COPY hermes-fund.tar.gz /opt/hermes-fund.tar.gz
-RUN mkdir -p /opt/hermes-fund && \
-    tar -xzf /opt/hermes-fund.tar.gz -C /opt/hermes-fund && \
-    rm /opt/hermes-fund.tar.gz
-
 # Gateway port
 EXPOSE 18789
 

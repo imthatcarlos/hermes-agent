@@ -7,13 +7,7 @@ echo "Date: $(date)"
 export PATH="/opt/hermes/.venv/bin:$PATH"
 
 mkdir -p /app/workspace
-
-# Symlink Sherwood Fund into the volume-mounted ~/.hermes (anything baked into
-# /root/.hermes during the Docker build is shadowed by the runtime volume, so
-# the plugin lives at /opt/hermes-fund/ and we link it in on each start).
 mkdir -p /root/.hermes/plugins /root/.hermes/dashboard-themes
-ln -sfn /opt/hermes-fund/plugins/hermes-fund /root/.hermes/plugins/hermes-fund
-ln -sf  /opt/hermes-fund/dashboard-themes/sherwood.yaml /root/.hermes/dashboard-themes/sherwood.yaml
 
 # Start the Hermes dashboard behind a Caddy basic-auth reverse proxy.
 #
